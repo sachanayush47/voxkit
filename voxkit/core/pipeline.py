@@ -7,7 +7,7 @@ from typing import AsyncIterator, Optional
 from langgraph.graph.state import CompiledStateGraph
 
 from voxkit.stt import STTEvent, STTEventType, STTProvider
-from voxkit.tts import TTSEvent, TTSEventType
+from voxkit.llm import LLMEvent, LLMEventType
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ class VoxkitPipeline:
         self.thread_id = thread_id  # Passed to the agent on every turn so checkpointed memory persists
 
         self.stt_output_queue: asyncio.Queue[STTEvent] = self.stt.queue
-        self.llm_output_queue: asyncio.Queue[TTSEvent] = asyncio.Queue()
+        self.llm_output_queue: asyncio.Queue[LLMEvent] = asyncio.Queue()
 
         self._background_tasks: list[asyncio.Task] = []
         self._turn_task: Optional[asyncio.Task] = None
@@ -76,7 +76,7 @@ class VoxkitPipeline:
             # Wake up a TTS consumer that might be blocked on queue.get() so it
             # actively stops whatever it's synthesizing/playing right now,
             # rather than just idling until the next sentence.
-            await self.__signal(TTSEvent(TTSEventType.INTERRUPT))
+            await self.__signal(LLMEvent(LLMEventType.INTERRUPT))
 
     async def __handle_user_turn(self, text: str):
         # Fresh cancel event per turn - the previous one (if any) stays set for
@@ -89,7 +89,7 @@ class VoxkitPipeline:
             async for sentence in self.__stream_agent_sentences(text, cancel_event):
                 if cancel_event.is_set():
                     break
-                await self.llm_output_queue.put(TTSEvent(TTSEventType.SENTENCE, sentence))
+                await self.llm_output_queue.put(LLMEvent(LLMEventType.SENTENCE, sentence))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -101,9 +101,9 @@ class VoxkitPipeline:
             # interrupt already fired for this same turn, the consumer will see
             # INTERRUPT followed by END_OF_TURN back to back -- harmless, since
             # both are no-ops for a consumer that isn't currently mid-sentence.
-            await self.__signal(TTSEvent(TTSEventType.END_OF_TURN))
+            await self.__signal(LLMEvent(LLMEventType.END_OF_TURN))
 
-    async def __signal(self, event: TTSEvent):
+    async def __signal(self, event: LLMEvent):
         """
         Non-blocking push for control events (END_OF_TURN / INTERRUPT). These
         aren't real content and shouldn't be subject to the same backpressure

@@ -38,6 +38,6 @@ class STTProvider(ABC):
     async def close(self) -> None: ...
 
 
-class Options(BaseModel):
+class STTOptions(BaseModel):
     pass
 

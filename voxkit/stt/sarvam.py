@@ -2,14 +2,14 @@ import asyncio
 import base64
 import logging
 
-from voxkit.stt import Options, STTProvider, STTEventType, STTEvent
+from voxkit.stt import STTOptions, STTProvider, STTEventType, STTEvent
 from sarvamai import AsyncSarvamAI
 from typing import AsyncIterator
 
 
 logger = logging.getLogger(__name__)
 
-class SarvamOptions(Options):
+class SarvamSTTOptions(STTOptions):
     api_key: str
     model: str
     mode: str
@@ -22,7 +22,7 @@ class SarvamOptions(Options):
 
 
 class SarvamSTTProvider(STTProvider):
-    def __init__(self, options: SarvamOptions, queue: asyncio.Queue[STTEvent]):
+    def __init__(self, options: SarvamSTTOptions, queue: asyncio.Queue[STTEvent]):
         self.options = options
         self.queue = queue
         self.client = AsyncSarvamAI(api_subscription_key=options.api_key)

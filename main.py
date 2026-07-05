@@ -9,7 +9,8 @@ from langchain.agents import create_agent
 from langchain_groq import ChatGroq
 
 from voxkit.core.pipeline import VoxkitPipeline
-from voxkit.stt import SarvamOptions, SarvamSTTProvider
+from voxkit.llm import LLMEventType
+from voxkit.stt import SarvamSTTOptions, SarvamSTTProvider
 
 load_dotenv()
 
@@ -25,7 +26,7 @@ CHANNELS = 1
 CHUNK_MS = 100
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_MS / 1000)
 
-options = SarvamOptions(
+options = SarvamSTTOptions(
     api_key=os.getenv("SARVAM_API_KEY"),
     model="saaras:v3",
     mode="transcribe",
@@ -61,11 +62,14 @@ async def microphone_stream() -> AsyncIterator[bytes]:
 
 async def log_llm_output(queue: asyncio.Queue) -> None:
     while True:
-        sentence = await queue.get()
-        if sentence is None:
-            logger.info("Turn complete")
-        else:
-            logger.info("LLM: %s", sentence)
+        event = await queue.get()
+        match event.type:
+            case LLMEventType.SENTENCE:
+                logger.info("LLM: %s", event.text)
+            case LLMEventType.END_OF_TURN:
+                logger.info("Turn complete")
+            case LLMEventType.INTERRUPT:
+                logger.info("Interrupted")
 
 
 async def main() -> None:

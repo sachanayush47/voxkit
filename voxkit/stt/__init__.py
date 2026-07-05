@@ -1,4 +1,4 @@
-from voxkit.stt.base import Options, STTProvider, STTEventType, STTEvent
-from voxkit.stt.sarvam import SarvamOptions, SarvamSTTProvider
+from voxkit.stt.base import STTOptions, STTProvider, STTEventType, STTEvent
+from voxkit.stt.sarvam import SarvamSTTOptions, SarvamSTTProvider
 
-__all__ = ["Options", "SarvamOptions", "STTProvider", "SarvamSTTProvider", "STTEventType", "STTEvent"]
+__all__ = ["STTOptions", "SarvamSTTOptions", "STTProvider", "SarvamSTTProvider", "STTEventType", "STTEvent"]
