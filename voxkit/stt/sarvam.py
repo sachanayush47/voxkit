@@ -22,14 +22,13 @@ class SarvamSTTOptions(STTOptions):
 
 
 class SarvamSTTProvider(STTProvider):
-    def __init__(self, options: SarvamSTTOptions, queue: asyncio.Queue[STTEvent]):
+    def __init__(self, options: SarvamSTTOptions):
+        super().__init__()
         self.options = options
-        self.queue = queue
         self.client = AsyncSarvamAI(api_subscription_key=options.api_key)
         self.ws = None
 
         self._ctx = None
-
 
     async def connect(self):
         self._ctx = self.client.speech_to_text_streaming.connect(
@@ -59,7 +58,7 @@ class SarvamSTTProvider(STTProvider):
             raise  # Normal shutdown path - don't report as a stream failure
         except Exception:
             logger.exception("SarvamSTTProvider: audio send failed")
-            await self.queue.put(STTEvent(STTEventType.STREAM_CLOSED))
+            await self.output.put(STTEvent(STTEventType.STREAM_CLOSED))
 
     async def receive(self):
         if not self.ws:
@@ -71,16 +70,16 @@ class SarvamSTTProvider(STTProvider):
                     signal = message.data.signal_type
                     logger.info(f"Voice activity: {signal}")
                     if signal == "START_SPEECH":
-                        await self.queue.put(STTEvent(STTEventType.SPEECH_START))
+                        await self.output.put(STTEvent(STTEventType.SPEECH_START))
                     elif signal == "END_SPEECH":
-                        await self.queue.put(STTEvent(STTEventType.SPEECH_END))
+                        await self.output.put(STTEvent(STTEventType.SPEECH_END))
                     else:
                         logger.warning(f"Unknown VAD signal_type: {signal}")
 
                 elif message.type == "data":
                     # No partial variant shown in Sarvam's docs or sample -- always final.
                     logger.debug(f"Transcript: {message.data.transcript}")
-                    await self.queue.put(STTEvent(STTEventType.FINAL_TRANSCRIPT, message.data.transcript))
+                    await self.output.put(STTEvent(STTEventType.FINAL_TRANSCRIPT, message.data.transcript))
 
                 else:
                     logger.warning(f"Unknown message type: {message.type}")
@@ -88,7 +87,7 @@ class SarvamSTTProvider(STTProvider):
             raise
         except Exception:
             logger.exception("SarvamSTTProvider: receive loop failed")
-            await self.queue.put(STTEvent(STTEventType.STREAM_CLOSED))
+            await self.output.put(STTEvent(STTEventType.STREAM_CLOSED))
 
     async def close(self):
         if self._ctx is not None:

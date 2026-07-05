@@ -23,7 +23,9 @@ class STTEvent:
 
 
 class STTProvider(ABC):
-    queue: asyncio.Queue[STTEvent]
+    def __init__(self) -> None:
+        super().__init__()
+        self.output: asyncio.Queue[STTEvent] = asyncio.Queue()
 
     @abstractmethod
     async def send(self, audio_stream: AsyncIterator[bytes]) -> AsyncIterator[str]: ...
@@ -36,6 +38,9 @@ class STTProvider(ABC):
 
     @abstractmethod
     async def close(self) -> None: ...
+
+    def get_output_queue(self) -> asyncio.Queue[STTEvent]:
+        return self.output
 
 
 class STTOptions(BaseModel):

@@ -2,25 +2,37 @@ import asyncio
 import logging
 import re
 
-from typing import AsyncIterator, Optional
+from typing import Awaitable, Callable, AsyncIterator, Optional
 
 from langgraph.graph.state import CompiledStateGraph
 
 from voxkit.stt import STTEvent, STTEventType, STTProvider
+from voxkit.tts import TTSEvent, TTSEventType, TTSProvider
 from voxkit.llm import LLMEvent, LLMEventType
 
 logger = logging.getLogger(__name__)
 
 SENTENCE_BOUNDARY = re.compile(r"[.!?]+[\s]|[,;][\s]")
 
+
 class VoxkitPipeline:
-    def __init__(self, stt: STTProvider, agent: CompiledStateGraph, thread_id: str = "default"):
+    def __init__(
+        self,
+        stt: STTProvider,
+        tts: TTSProvider,
+        agent: CompiledStateGraph,
+        callback: Callable[[TTSEvent], Awaitable[None]],
+        thread_id: str = "default",
+    ):
         self.stt: STTProvider = stt
+        self.tts: TTSProvider = tts
         self.agent: CompiledStateGraph = agent
+        self.callback = callback  # receives full TTSEvent -- client decides what to do per event.type
         self.thread_id = thread_id  # Passed to the agent on every turn so checkpointed memory persists
 
-        self.stt_output_queue: asyncio.Queue[STTEvent] = self.stt.queue
-        self.llm_output_queue: asyncio.Queue[LLMEvent] = asyncio.Queue()
+        self.stt_output_queue: asyncio.Queue[STTEvent] = self.stt.get_output_queue()
+        self.llm_output_queue: asyncio.Queue[LLMEvent] = self.tts.get_input_queue()
+        self.tts_output_queue: asyncio.Queue[TTSEvent] = self.tts.get_output_queue()
 
         self._background_tasks: list[asyncio.Task] = []
         self._turn_task: Optional[asyncio.Task] = None
@@ -28,9 +40,12 @@ class VoxkitPipeline:
 
     async def run(self, audio_stream: AsyncIterator[bytes]):
         await self.stt.connect()
+        await self.tts.connect()
+        self.tts.synthesize()
 
         self._background_tasks.append(asyncio.create_task(self.stt.send(audio_stream)))
         self._background_tasks.append(asyncio.create_task(self.stt.receive()))
+        self._background_tasks.append(asyncio.create_task(self.__consume_tts_output()))
 
         try:
             await self.__consume_stt_events()
@@ -66,17 +81,21 @@ class VoxkitPipeline:
             self._cancel_event.set()
             self._turn_task.cancel()
 
-            # Drain anything already queued for TTS - it's stale now.
-            while not self.llm_output_queue.empty():
-                try:
-                    self.llm_output_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            # Drain + signal both downstream queues. Sentences waiting to be
+            # spoken (llm_output_queue) and audio already synthesized but not
+            # yet forwarded to the client (tts_output_queue) are both stale now.
+            await self.__drain(self.llm_output_queue)
+            await self.__signal(self.llm_output_queue, LLMEvent(LLMEventType.INTERRUPT))
 
-            # Wake up a TTS consumer that might be blocked on queue.get() so it
-            # actively stops whatever it's synthesizing/playing right now,
-            # rather than just idling until the next sentence.
-            await self.__signal(LLMEvent(LLMEventType.INTERRUPT))
+            await self.__drain(self.tts_output_queue)
+            await self.__signal(self.tts_output_queue, TTSEvent(TTSEventType.INTERRUPT))
+
+    async def __drain(self, queue: "asyncio.Queue"):
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def __handle_user_turn(self, text: str):
         # Fresh cancel event per turn - the previous one (if any) stays set for
@@ -95,30 +114,29 @@ class VoxkitPipeline:
         except Exception:
             logger.exception("VoxkitPipeline: agent turn failed")
         finally:
-            # Sentinel: tells the TTS consumer this turn's sentences are complete.
-            # Distinct from TTSEventType.INTERRUPT -- this means "nothing more is
+            # Sentinel: tells the TTS provider this turn's sentences are complete.
+            # Distinct from LLMEventType.INTERRUPT -- this means "nothing more is
             # coming for now," not "stop what's currently playing." If an
-            # interrupt already fired for this same turn, the consumer will see
-            # INTERRUPT followed by END_OF_TURN back to back -- harmless, since
-            # both are no-ops for a consumer that isn't currently mid-sentence.
-            await self.__signal(LLMEvent(LLMEventType.END_OF_TURN))
+            # interrupt already fired for this same turn, the provider will see
+            # INTERRUPT followed by END_OF_TURN back to back -- harmless.
+            await self.__signal(self.llm_output_queue, LLMEvent(LLMEventType.END_OF_TURN))
 
-    async def __signal(self, event: LLMEvent):
+    async def __signal(self, queue: "asyncio.Queue", event):
         """
-        Non-blocking push for control events (END_OF_TURN / INTERRUPT). These
+        Non-blocking push for control events (END_OF_TURN / INTERRUPT), usable
+        against either llm_output_queue or tts_output_queue. Control events
         aren't real content and shouldn't be subject to the same backpressure
-        as sentences -- if the queue is bounded (e.g. maxsize=2) and full, a
-        plain `put()` would suspend waiting for space, which defeats the
-        purpose of a signal that needs to land immediately. Evict the oldest
-        item instead of waiting.
+        as sentences/audio -- if a queue is bounded and full, a plain `put()`
+        would suspend waiting for space, which defeats the purpose of a signal
+        that needs to land immediately. Evict the oldest item instead of waiting.
         """
         while True:
             try:
-                self.llm_output_queue.put_nowait(event)
+                queue.put_nowait(event)
                 return
             except asyncio.QueueFull:
                 try:
-                    self.llm_output_queue.get_nowait()
+                    queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
 
@@ -161,6 +179,40 @@ class VoxkitPipeline:
         if buffer.strip() and not cancel_event.is_set():
             yield buffer.strip()
 
+    async def __consume_tts_output(self):
+        """
+        Drains events from the TTS provider's output queue and forwards each
+        one, as-is, to the client callback. The pipeline doesn't unpack or
+        transform the event for the client -- it forwards the full TTSEvent
+        (type + payload) so the client can branch on event.type itself
+        (AUDIO -> play, INTERRUPT -> stop/clear playback, END_OF_TURN -> mark
+        the bot's turn as finished, etc). Server-side logging still happens
+        here for observability, independent of what the client does with it.
+        """
+        while True:
+            event = await self.tts_output_queue.get()
+
+            if event.type == TTSEventType.END_OF_TURN:
+                logger.debug("VoxkitPipeline: TTS finished speaking this turn")
+
+            elif event.type == TTSEventType.INTERRUPT:
+                logger.info("VoxkitPipeline: forwarding barge-in to client")
+
+            elif event.type == TTSEventType.STREAM_CLOSED:
+                # The provider already attempts its own reconnect internally
+                # before giving up -- by the time this event reaches us, that
+                # has either already succeeded (and audio will keep flowing)
+                # or the provider's internal task has ended for good. Logged
+                # here for observability; still forwarded below in case the
+                # client wants to show a connection-issue indicator.
+                logger.error(
+                    "VoxkitPipeline: TTS reported STREAM_CLOSED -- if this "
+                    "doesn't self-resolve, the provider's internal task may "
+                    "have died; consider monitoring task health directly."
+                )
+
+            await self.callback(event)
+
     async def shutdown(self):
         for task in self._background_tasks:
             if not task.done():
@@ -169,3 +221,4 @@ class VoxkitPipeline:
             self._turn_task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
         await self.stt.close()
+        await self.tts.close()
