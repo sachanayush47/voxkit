@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 
 from voxkit.stt import Options, STTProvider, STTEventType, STTEvent
@@ -13,10 +14,11 @@ class SarvamOptions(Options):
     model: str
     mode: str
     language_code: str | None = None
-    high_vad_sensitivity: bool
-    vad_signals: bool
-    encoding: str
-    sample_rate: int
+    high_vad_sensitivity: bool = True
+    vad_signals: bool = True
+    encoding: str = "audio/wav"
+    input_audio_codec: str = "pcm_s16le"
+    sample_rate: int = 16000
 
 
 class SarvamSTTProvider(STTProvider):
@@ -35,6 +37,7 @@ class SarvamSTTProvider(STTProvider):
             model=self.options.model,
             mode=self.options.mode,
             sample_rate=self.options.sample_rate,
+            input_audio_codec=self.options.input_audio_codec,
             high_vad_sensitivity=self.options.high_vad_sensitivity,
             vad_signals=self.options.vad_signals,
             api_subscription_key=self.options.api_key,
@@ -48,7 +51,7 @@ class SarvamSTTProvider(STTProvider):
         try:
             async for chunk in audio_stream:
                 await self.ws.transcribe(
-                    audio=chunk,
+                    audio=base64.b64encode(chunk).decode("utf-8"),
                     encoding=self.options.encoding,
                     sample_rate=self.options.sample_rate
                 )

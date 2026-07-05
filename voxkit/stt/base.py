@@ -1,22 +1,11 @@
-from dataclasses import dataclass
+import asyncio
 
 from abc import ABC, abstractmethod
-from typing import AsyncIterator
+from dataclasses import dataclass
 from enum import Enum, auto
+from typing import AsyncIterator
+
 from pydantic import BaseModel
-
-
-class STTProvider(ABC):
-
-    @abstractmethod
-    async def send(self, audio_stream: AsyncIterator[bytes]) -> AsyncIterator[str]: ...
-
-    @abstractmethod
-    async def receive(self) -> AsyncIterator[str]: ...
-
-
-class Options(BaseModel):
-    pass
 
 
 class STTEventType(Enum):
@@ -31,3 +20,24 @@ class STTEventType(Enum):
 class STTEvent:
     type: STTEventType
     text: str | None = None
+
+
+class STTProvider(ABC):
+    queue: asyncio.Queue[STTEvent]
+
+    @abstractmethod
+    async def send(self, audio_stream: AsyncIterator[bytes]) -> AsyncIterator[str]: ...
+
+    @abstractmethod
+    async def receive(self) -> AsyncIterator[str]: ...
+
+    @abstractmethod
+    async def connect(self) -> None: ...
+
+    @abstractmethod
+    async def close(self) -> None: ...
+
+
+class Options(BaseModel):
+    pass
+
