@@ -1,3 +1,4 @@
-from voxkit.tts.base import TTSEventType, TTSEvent
+from voxkit.tts.base import TTSOptions, TTSProvider, TTSEventType, TTSEvent
+from voxkit.tts.sarvam import SarvamTTSOptions, SarvamTTSProvider
 
-__all__ = ["TTSEventType", "TTSEvent"]
+__all__ = ["TTSOptions", "TTSProvider", "TTSEventType", "TTSEvent", "SarvamTTSOptions", "SarvamTTSProvider"]
