@@ -12,7 +12,7 @@ class SarvamOptions(Options):
     api_key: str
     model: str
     mode: str
-    language_code: str
+    language_code: str | None = None
     high_vad_sensitivity: bool
     vad_signals: bool
     encoding: str
