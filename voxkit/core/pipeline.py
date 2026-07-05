@@ -1,16 +1,17 @@
 import asyncio
 import logging
 import re
+
 from typing import AsyncIterator, Optional
 
 from langgraph.graph.state import CompiledStateGraph
 
 from voxkit.stt import STTEvent, STTEventType, STTProvider
+from voxkit.tts import TTSEvent, TTSEventType
 
 logger = logging.getLogger(__name__)
 
 SENTENCE_BOUNDARY = re.compile(r"[.!?]+[\s]|[,;][\s]")
-
 
 class VoxkitPipeline:
     def __init__(self, stt: STTProvider, agent: CompiledStateGraph, thread_id: str = "default"):
@@ -19,7 +20,7 @@ class VoxkitPipeline:
         self.thread_id = thread_id  # Passed to the agent on every turn so checkpointed memory persists
 
         self.stt_output_queue: asyncio.Queue[STTEvent] = self.stt.queue
-        self.llm_output_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        self.llm_output_queue: asyncio.Queue[TTSEvent] = asyncio.Queue()
 
         self._background_tasks: list[asyncio.Task] = []
         self._turn_task: Optional[asyncio.Task] = None
@@ -73,8 +74,9 @@ class VoxkitPipeline:
                     break
 
             # Wake up a TTS consumer that might be blocked on queue.get() so it
-            # notices the interruption instead of speaking a stale sentence.
-            await self.llm_output_queue.put(None)
+            # actively stops whatever it's synthesizing/playing right now,
+            # rather than just idling until the next sentence.
+            await self.__signal(TTSEvent(TTSEventType.INTERRUPT))
 
     async def __handle_user_turn(self, text: str):
         # Fresh cancel event per turn - the previous one (if any) stays set for
@@ -87,18 +89,38 @@ class VoxkitPipeline:
             async for sentence in self.__stream_agent_sentences(text, cancel_event):
                 if cancel_event.is_set():
                     break
-                await self.llm_output_queue.put(sentence)
+                await self.llm_output_queue.put(TTSEvent(TTSEventType.SENTENCE, sentence))
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("VoxkitPipeline: agent turn failed")
         finally:
             # Sentinel: tells the TTS consumer this turn's sentences are complete.
-            # NOTE: if interrupt already pushed a None for this same turn, the
-            # consumer will see two Nones back to back - harmless, but worth
-            # knowing if your TTS consumer treats None as anything other than
-            # "no more sentences right now."
-            await self.llm_output_queue.put(None)
+            # Distinct from TTSEventType.INTERRUPT -- this means "nothing more is
+            # coming for now," not "stop what's currently playing." If an
+            # interrupt already fired for this same turn, the consumer will see
+            # INTERRUPT followed by END_OF_TURN back to back -- harmless, since
+            # both are no-ops for a consumer that isn't currently mid-sentence.
+            await self.__signal(TTSEvent(TTSEventType.END_OF_TURN))
+
+    async def __signal(self, event: TTSEvent):
+        """
+        Non-blocking push for control events (END_OF_TURN / INTERRUPT). These
+        aren't real content and shouldn't be subject to the same backpressure
+        as sentences -- if the queue is bounded (e.g. maxsize=2) and full, a
+        plain `put()` would suspend waiting for space, which defeats the
+        purpose of a signal that needs to land immediately. Evict the oldest
+        item instead of waiting.
+        """
+        while True:
+            try:
+                self.llm_output_queue.put_nowait(event)
+                return
+            except asyncio.QueueFull:
+                try:
+                    self.llm_output_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
 
     async def __stream_agent_sentences(
         self, text: str, cancel_event: asyncio.Event
