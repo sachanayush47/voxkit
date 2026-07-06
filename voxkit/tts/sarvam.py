@@ -2,7 +2,7 @@ import asyncio
 import base64
 import logging
 
-from sarvamai import AsyncSarvamAI, AudioOutput, EventResponse
+from sarvamai import AsyncSarvamAI, AudioOutput, EventResponse, ErrorResponse
 
 from voxkit.llm import LLMEvent, LLMEventType
 from voxkit.tts import TTSOptions, TTSProvider, TTSEvent, TTSEventType
@@ -16,6 +16,8 @@ class SarvamTTSOptions(TTSOptions):
     target_language_code: str
     speaker: str
     send_completion_event: bool = True
+    output_audio_codec: str = "linear16"
+    speech_sample_rate: int = 24000
 
 
 class SarvamTTSProvider(TTSProvider):
@@ -40,12 +42,14 @@ class SarvamTTSProvider(TTSProvider):
         await self.ws.configure(
             target_language_code=self.options.target_language_code,
             speaker=self.options.speaker,
+            output_audio_codec=self.options.output_audio_codec,
+            speech_sample_rate=self.options.speech_sample_rate,
         )
 
     def synthesize(self):
         """Spins up the internal send/receive loops. Call after connect()."""
         self._tasks.append(asyncio.create_task(self._send()))
-        self._tasks.append(asyncio.create_task(self._receive_supervisor()))
+        self._tasks.append(asyncio.create_task(self._receive_with_reconnect()))
 
     async def _reconnect(self):
         """
@@ -101,6 +105,9 @@ class SarvamTTSProvider(TTSProvider):
                 logger.debug(f"Received completion event: {message.data.event_type}")
                 if message.data.event_type == "final":
                     await self.output.put(TTSEvent(TTSEventType.END_OF_TURN))
+
+            elif isinstance(message, ErrorResponse):
+                logger.error(f"SarvamTTSProvider received error response: {message.data.message}")
 
     async def _receive_with_reconnect(self):
         """
