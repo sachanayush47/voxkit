@@ -37,6 +37,9 @@ class VoxkitPipeline:
         self._background_tasks: list[asyncio.Task] = []
         self._turn_task: Optional[asyncio.Task] = None
         self._cancel_event: asyncio.Event = asyncio.Event()
+        
+        # Tracks whether the bot is actually speaking right now
+        self._is_bot_speaking: bool = False
 
     async def run(self, audio_stream: AsyncIterator[bytes]):
         await self.stt.connect()
@@ -76,19 +79,34 @@ class VoxkitPipeline:
                 return
 
     async def __handle_interrupt(self):
+        # Always drain + signal tts_output_queue
+        # Draining first, then signaling, preserves ordering: nothing stale
+        # can arrive at the client after this INTERRUPT event, since
+        # __consume_tts_output is the only thing that ever calls the client
+        # callback, and it processes this queue strictly in order.
+        await self.__drain(self.tts_output_queue)
+        await self.__signal(self.tts_output_queue, TTSEvent(TTSEventType.INTERRUPT))
+
+        if not self._is_bot_speaking:
+            # Nothing server-side needs cancelling/reconnecting - the LLM
+            # already finished this turn and TTS already sent everything.
+            # The client-side notify above is enough to handle any audio
+            # still sitting in the client's own playback buffer.
+            return
+
+        logger.info("Interrupt detected, cancelling in-flight generation and reconnecting TTS")
+
         if self._turn_task and not self._turn_task.done():
-            logger.info("Interrupt detected, cancelling in-flight agent turn")
             self._cancel_event.set()
             self._turn_task.cancel()
 
-            # Drain + signal both downstream queues. Sentences waiting to be
-            # spoken (llm_output_queue) and audio already synthesized but not
-            # yet forwarded to the client (tts_output_queue) are both stale now.
-            await self.__drain(self.llm_output_queue)
-            await self.__signal(self.llm_output_queue, LLMEvent(LLMEventType.INTERRUPT))
+        # This is the expensive path (triggers SarvamTTSProvider._reconnect())
+        # Only worth paying when the server genuinely believes generation
+        # or synthesis is still in flight.
+        await self.__drain(self.llm_output_queue)
+        await self.__signal(self.llm_output_queue, LLMEvent(LLMEventType.INTERRUPT))
 
-            await self.__drain(self.tts_output_queue)
-            await self.__signal(self.tts_output_queue, TTSEvent(TTSEventType.INTERRUPT))
+        self._is_bot_speaking = False
 
     async def __drain(self, queue: "asyncio.Queue"):
         while not queue.empty():
@@ -101,6 +119,7 @@ class VoxkitPipeline:
         # Fresh cancel event per turn - the previous one (if any) stays set for
         # the task that's unwinding; this one is what the new turn checks.
         self._cancel_event = asyncio.Event()
+        self._is_bot_speaking = True  # Optimistic - sentences will start flowing to TTS momentarily
         self._turn_task = asyncio.create_task(self.__run_agent_turn(text, self._cancel_event))
 
     async def __run_agent_turn(self, text: str, cancel_event: asyncio.Event):
@@ -194,6 +213,7 @@ class VoxkitPipeline:
 
             if event.type == TTSEventType.END_OF_TURN:
                 logger.debug("VoxkitPipeline: TTS finished speaking this turn")
+                self._is_bot_speaking = False
 
             elif event.type == TTSEventType.INTERRUPT:
                 logger.info("VoxkitPipeline: forwarding barge-in to client")

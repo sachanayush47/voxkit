@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -11,6 +12,7 @@ from langchain_groq import ChatGroq
 from voxkit.core.pipeline import VoxkitPipeline
 from voxkit.llm import LLMEventType
 from voxkit.stt import SarvamSTTOptions, SarvamSTTProvider
+from voxkit.tts import SarvamTTSOptions, SarvamTTSProvider, TTSEvent, TTSEventType
 
 load_dotenv()
 
@@ -35,6 +37,13 @@ options = SarvamSTTOptions(
     vad_signals=True,
     input_audio_codec="pcm_s16le",
     sample_rate=SAMPLE_RATE,
+)
+
+tts_options = SarvamTTSOptions(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    model="bulbul:v3",
+    target_language_code="en-IN",
+    speaker="priya",
 )
 
 
@@ -73,12 +82,28 @@ async def log_llm_output(queue: asyncio.Queue) -> None:
 
 
 async def main() -> None:
-    stt = SarvamSTTProvider(options, asyncio.Queue())
+    stt = SarvamSTTProvider(options)
+    tts = SarvamTTSProvider(tts_options)
     agent = create_agent(
         model=ChatGroq(model="llama-3.3-70b-versatile"),
         tools=[],
     )
-    pipeline = VoxkitPipeline(stt, agent)
+
+    playback = sd.RawOutputStream(
+        samplerate=tts_options.speech_sample_rate,
+        channels=CHANNELS,
+        dtype="int16",
+    )
+    playback.start()
+
+    async def handle_tts_event(event: TTSEvent) -> None:
+        if event.type == TTSEventType.AUDIO and event.audio:
+            await asyncio.to_thread(playback.write, base64.b64decode(event.audio))
+        elif event.type == TTSEventType.INTERRUPT:
+            await asyncio.to_thread(playback.abort)
+            await asyncio.to_thread(playback.start)
+
+    pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event)
 
     logger.info("Speak into your microphone (Ctrl+C to stop)...")
 
@@ -90,6 +115,8 @@ async def main() -> None:
     finally:
         output_task.cancel()
         await asyncio.gather(output_task, return_exceptions=True)
+        playback.stop()
+        playback.close()
 
 
 if __name__ == "__main__":
