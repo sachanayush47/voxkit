@@ -23,12 +23,14 @@ class VoxkitPipeline:
         agent: CompiledStateGraph,
         callback: Callable[[TTSEvent], Awaitable[None]],
         thread_id: str = "default",
+        interrupt: bool = True,
     ):
         self.stt: STTProvider = stt
         self.tts: TTSProvider = tts
         self.agent: CompiledStateGraph = agent
         self.callback = callback  # receives full TTSEvent -- client decides what to do per event.type
         self.thread_id = thread_id  # Passed to the agent on every turn so checkpointed memory persists
+        self.interrupt = interrupt  # if False, SPEECH_START never cancels/barges in on the current turn
 
         self.stt_output_queue: asyncio.Queue[STTEvent] = self.stt.get_output_queue()
         self.llm_output_queue: asyncio.Queue[LLMEvent] = self.tts.get_input_queue()
@@ -62,7 +64,8 @@ class VoxkitPipeline:
             if event.type == STTEventType.SPEECH_START:
                 # Interrupt: user started talking while the agent may still be
                 # generating/speaking. Cancel the in-flight turn immediately.
-                await self.__handle_interrupt()
+                if self.interrupt:
+                    await self.__handle_interrupt()
 
             elif event.type == STTEventType.FINAL_TRANSCRIPT:
                 if event.text and event.text.strip():

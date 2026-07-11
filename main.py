@@ -103,7 +103,7 @@ async def main() -> None:
             await asyncio.to_thread(playback.abort)
             await asyncio.to_thread(playback.start)
 
-    pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event)
+    pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event, interrupt=True)
 
     logger.info("Speak into your microphone (Ctrl+C to stop)...")
 
