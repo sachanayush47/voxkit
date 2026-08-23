@@ -7,16 +7,16 @@ events out while handling turn-taking and barge-in (interrupt) internally.
 """
 
 import asyncio
+import contextlib
 import logging
 import re
-
-from typing import Awaitable, Callable, AsyncIterator, Optional
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from langgraph.graph.state import CompiledStateGraph
 
+from voxkit.llm import LLMEvent, LLMEventType
 from voxkit.stt import STTEvent, STTEventType, STTProvider
 from voxkit.tts import TTSEvent, TTSEventType, TTSProvider
-from voxkit.llm import LLMEvent, LLMEventType
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ class VoxkitPipeline:
         self.tts_output_queue: asyncio.Queue[TTSEvent] = self.tts.get_output_queue()
 
         self._background_tasks: list[asyncio.Task] = []
-        self._turn_task: Optional[asyncio.Task] = None
+        self._turn_task: asyncio.Task | None = None
         self._cancel_event: asyncio.Event = asyncio.Event()
 
         # Tracks whether the bot is actually speaking right now
@@ -138,10 +138,9 @@ class VoxkitPipeline:
                 if event.text and event.text.strip():
                     await self.__handle_user_turn(event.text.strip())
 
-            elif event.type == STTEventType.SPEECH_END:
-                pass
-
-            elif event.type == STTEventType.PARTIAL_TRANSCRIPT:
+            elif event.type in (STTEventType.SPEECH_END, STTEventType.PARTIAL_TRANSCRIPT):
+                # Knowingly ignored: turn boundaries come from FINAL_TRANSCRIPT,
+                # and partials are never handed to the agent.
                 pass
 
             elif event.type == STTEventType.STREAM_CLOSED:
@@ -242,14 +241,11 @@ class VoxkitPipeline:
                 queue.put_nowait(event)
                 return
             except asyncio.QueueFull:
-                try:
+                # Raced with a consumer that already drained it -- retry the put.
+                with contextlib.suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
 
-    async def __stream_agent_sentences(
-        self, text: str, cancel_event: asyncio.Event
-    ) -> AsyncIterator[str]:
+    async def __stream_agent_sentences(self, text: str, cancel_event: asyncio.Event) -> AsyncIterator[str]:
         """Stream tokens from the LangGraph agent, yielding complete sentences as boundaries are found.
 
         NOTE: Verify this against your actual LangGraph version. ``stream_mode="messages"``

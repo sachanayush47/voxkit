@@ -70,4 +70,39 @@ asyncio.run(main())
 
 See [`main.py`](https://github.com/sachanayush47/voxkit/blob/master/main.py) in the repo for a complete, runnable example using `sounddevice` for microphone capture and playback.
 
+## Tuning the Sarvam providers
+
+The quick start above passes only the required options. Both option classes mirror Sarvam's full set of streaming websocket parameters — voice and audio format, prosody, and the VAD thresholds that decide when a turn (and a barge-in) starts. **Every default is the `sarvamai` SDK's own default**, so the quick start behaves exactly as the SDK does out of the box, and you only pass what you actually want to change:
+
+```python
+stt = SarvamSTTProvider(SarvamSTTOptions(
+    api_key=os.environ["SARVAM_API_KEY"],
+    model="saaras:v3",
+    mode="codemix",                        # English words in English, Indic in native script
+    language_code="hi-IN",
+    sample_rate=8000,                      # telephony audio
+    input_audio_codec="pcm_s16le",
+    high_vad_sensitivity=True,
+    interrupt_min_speech_frames=6,         # make barge-in less twitchy
+    start_speech_volume_threshold=-45.0,   # ignore background noise
+    pre_speech_pad_frames=3,               # don't clip the start of the utterance
+))
+
+tts = SarvamTTSProvider(SarvamTTSOptions(
+    api_key=os.environ["SARVAM_API_KEY"],
+    model="bulbul:v3",
+    target_language_code="hi-IN",
+    speaker="priya",
+    speech_sample_rate=24000,
+    output_audio_codec="linear16",
+    pace=1.1,
+    temperature=0.4,                       # bulbul:v3 only
+    min_buffer_size=30,                    # flush sooner -> lower first-audio latency
+))
+```
+
+The STT VAD knobs are the one group with no SDK-side default — those numbers live server-side, so they default to `None` and aren't sent at all unless you set them, leaving Sarvam's default or the `high_vad_sensitivity` preset in charge.
+
+See [`SarvamSTTOptions`][voxkit.stt.sarvam.SarvamSTTOptions] and [`SarvamTTSOptions`][voxkit.tts.sarvam.SarvamTTSOptions] for every field, its accepted values, and which ones are model-specific (`pitch`/`loudness` are `bulbul:v2`-only; `temperature`/`dict_id` are `bulbul:v3`-only — Sarvam ignores the ones that don't apply).
+
 Continue to [Architecture](architecture.md) for how the pieces fit together, or jump straight to the [API Reference](reference/pipeline.md).

@@ -54,7 +54,6 @@ from voxkit.tts import (
 __version__ = "0.0.1"
 
 __all__ = [
-    "VoxkitPipeline",
     "LLMEvent",
     "LLMEventType",
     "STTEvent",
@@ -63,10 +62,11 @@ __all__ = [
     "STTProvider",
     "SarvamSTTOptions",
     "SarvamSTTProvider",
+    "SarvamTTSOptions",
+    "SarvamTTSProvider",
     "TTSEvent",
     "TTSEventType",
     "TTSOptions",
     "TTSProvider",
-    "SarvamTTSOptions",
-    "SarvamTTSProvider",
+    "VoxkitPipeline",
 ]

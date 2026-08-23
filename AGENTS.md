@@ -8,10 +8,20 @@ A thin, event-driven Python library for building real-time voice agents on top o
 - Install deps: `uv sync`
 - Run the example voice agent (mic in/out via `sounddevice`): `uv run main.py`
 - Build docs locally: `uv pip install -e ".[docs]"` then `mkdocs serve`
+- Lint + format: `uv run ruff check --fix .` and `uv run ruff format .`
+- Install the git hook once per clone: `uv run pre-commit install`. It runs
+  `ruff check --fix` then `ruff format` on staged files, so a commit can fail
+  once, apply fixes, and need re-staging.
 - No test suite exists yet.
 
 ## Code conventions
 
+- Ruff is the single source of truth for style, configured in `pyproject.toml`:
+  line length 120, target py313, and `E/W/F/I/UP/B/C4/SIM/RUF/D` selected. `D`
+  (pydocstyle, google convention) is on deliberately — docstrings *are* the
+  published API reference, so a missing one is a lint error, not a nitpick.
+  `main.py` and the empty stubs are per-file-ignored for `D`; don't widen those
+  ignores to cover new library code.
 - Google-style docstrings and full type annotations on all public modules/classes/methods — keep these accurate, since `mkdocstrings` renders them directly into the published API reference (`docs/reference/*.md`).
 - New STT/TTS backends implement the `STTProvider`/`TTSProvider` ABCs (`voxkit/stt/base.py`, `voxkit/tts/base.py`) — queue-in/queue-out, typed events. `VoxkitPipeline` only depends on these interfaces, never on a specific vendor.
 - Keep the library thin: no frame-based transport bus, no call/room management, no bundled VAD abstraction — STT/TTS providers report voice activity themselves.

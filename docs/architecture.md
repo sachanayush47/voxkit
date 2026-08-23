@@ -14,6 +14,8 @@ audio in ──▶ STTProvider ──▶ VoxkitPipeline ──▶ LangGraph agen
 4. **TTS emits [`TTSEvent`][voxkit.tts.base.TTSEvent]s** — `AUDIO` (a synthesized chunk), `END_OF_TURN`, `INTERRUPT`, `STREAM_CLOSED` — which the pipeline forwards verbatim to your `callback`. You decide what to do with each: play `AUDIO`, stop playback on `INTERRUPT`, mark the turn done on `END_OF_TURN`.
 5. **Barge-in:** if the STT provider reports `SPEECH_START` while the agent is still generating or TTS is still speaking, the pipeline cancels the in-flight turn, tells TTS to interrupt, and notifies your callback — all before the next turn starts. Pass `interrupt=False` to [`VoxkitPipeline`][voxkit.core.pipeline.VoxkitPipeline] to disable this and let turns run to completion regardless of new speech.
 
+    Because voxkit bundles no VAD of its own, *when* `SPEECH_START` fires is entirely the STT provider's decision — so how twitchy barge-in feels is tuned on the provider's options, not on the pipeline. With [`SarvamSTTOptions`][voxkit.stt.sarvam.SarvamSTTOptions] the relevant knobs are `interrupt_min_speech_frames` (how much speech must accumulate before a barge-in counts), `high_vad_sensitivity` plus `positive_speech_threshold`/`negative_speech_threshold` (what counts as speech at all), and `start_speech_volume_threshold` (a dB gate that keeps background noise from triggering turns).
+
 ## Event types
 
 | Module | Type | Values |

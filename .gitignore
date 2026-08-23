@@ -13,3 +13,5 @@ wheels/
 
 # mkdocs build output
 site/
+# Ruff cache
+.ruff_cache/

@@ -68,6 +68,60 @@ asyncio.run(main())
 
 See [`main.py`](main.py) for a complete, runnable example that captures microphone audio with `sounddevice` and plays synthesized speech back through your speakers.
 
+### Sarvam provider options
+
+Both option classes are pydantic models that mirror Sarvam's streaming websocket parameters. Only `api_key`, `model`, `mode` (STT) / `target_language_code`, `speaker` (TTS) are required; **every default below is the `sarvamai` SDK's own default**, so passing nothing extra behaves exactly like the SDK does out of the box. The two exceptions are TTS `output_audio_codec` and `speech_sample_rate`, which default to raw 24 kHz PCM (what voxkit's playback path wants) instead of the SDK's 22.05 kHz MP3.
+
+The SDK has no client-side values for the STT VAD knobs — those numbers live server-side — so they default to `None` and are simply not sent, leaving Sarvam's default or the `high_vad_sensitivity` preset in charge. Set one to override it.
+
+`SarvamSTTOptions` (`voxkit/stt/sarvam.py`):
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `api_key` | `str` | — | Sarvam API subscription key. |
+| `model` | `"saaras:v3"` \| `"saarika:v2.5"` | — | `saarika:v2.5` is legacy. |
+| `mode` | `"transcribe"` \| `"translate"` \| `"verbatim"` \| `"translit"` \| `"codemix"` | — | Transcript style. `saaras:v3` only. |
+| `language_code` | BCP-47 code, `"unknown"`, or `None` | `"unknown"` | `"unknown"`/`None` auto-detects and reports the language back. Twelve extra codes are `saaras:v3`-only. |
+| `encoding` | `str` | `"audio/wav"` | MIME-style encoding of the chunks you push in. |
+| `input_audio_codec` | `"wav"` \| `"pcm_s16le"` \| `"pcm_l16"` \| `"pcm_raw"` | `"pcm_s16le"` | Raw sample codec. |
+| `sample_rate` | `int` | `16000` | Only `8000` and `16000` are valid connection-level values; `8000` is available *only* this way. |
+| `vad_signals` | `bool` | `True` | Emit `START_SPEECH`/`END_SPEECH` → `SPEECH_START`/`SPEECH_END`. Defaults on because the pipeline needs it for barge-in. |
+| `flush_signal` | `bool \| None` | `None` | Allow forcing finalization via `SarvamSTTProvider.flush()`. |
+| `high_vad_sensitivity` | `bool` | `True` | High-sensitivity VAD preset; the thresholds below override it. |
+| `positive_speech_threshold` | `float \| None` (0-1) | `None` | Probability above which a frame is speech. |
+| `negative_speech_threshold` | `float \| None` (0-1) | `None` | Probability below which a frame is silence. |
+| `min_speech_frames` | `int \| None` | `None` | Frames needed to open a speech segment. |
+| `first_turn_min_speech_frames` | `int \| None` | `None` | Same, for the first user turn only. |
+| `negative_frames_count` | `int \| None` | `None` | Silence frames needed to close a segment. |
+| `negative_frames_window` | `int \| None` | `None` | Window the count above is measured over. |
+| `start_speech_volume_threshold` | `float \| None` | `None` | dB gate below which audio isn't speech. Unset = no gate. |
+| `interrupt_min_speech_frames` | `int \| None` | `None` | Frames needed to register a barge-in — tune this when interrupts fire too eagerly or too reluctantly. |
+| `pre_speech_pad_frames` | `int \| None` | `None` | Frames prepended before speech onset so the utterance isn't clipped. |
+| `num_initial_ignored_frames` | `int \| None` | `None` | Leading frames discarded at connection start. |
+
+`SarvamTTSOptions` (`voxkit/tts/sarvam.py`):
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `api_key` | `str` | — | Sarvam API subscription key. |
+| `model` | `"bulbul:v2"` \| `"bulbul:v3"` | — | See the model-specific notes below. |
+| `target_language_code` | BCP-47 code | — | One of eleven languages Sarvam synthesizes. |
+| `speaker` | voice name | — | Must belong to the chosen model (`priya`, `aditya`, … for v3; `anushka`, `abhilash`, … for v2). |
+| `send_completion_event` | `bool` | `True` | Sarvam sends a `final` event → `TTSEventType.END_OF_TURN`. |
+| `output_audio_codec` | `"linear16"` \| `"mulaw"` \| `"alaw"` \| `"opus"` \| `"flac"` \| `"aac"` \| `"wav"` \| `"mp3"` | `"linear16"` | `linear16` is raw PCM, which most playback paths want. |
+| `output_audio_bitrate` | `"32k"`…`"192k"` | `"128k"` | Only meaningful for compressed codecs. |
+| `speech_sample_rate` | `8000` \| `16000` \| `22050` \| `24000` | `24000` | Sarvam defaults to 22050 on v2, 24000 on v3. |
+| `pace` | `float` | `1.0` | Speech speed. 0.3-3.0 on v2, 0.5-2.0 on v3. |
+| `pitch` | `float` | `0.0` | -0.75 to 0.75. **v2 only.** |
+| `loudness` | `float` | `1.0` | 0.3 to 3.0. **v2 only.** |
+| `temperature` | `float` | `0.6` | 0.01 to 1.0; lower is more deterministic. **v3 only.** |
+| `enable_preprocessing` | `bool` | `False` | Normalize English words and numeric entities. Always on for v3 regardless. |
+| `dict_id` | `str \| None` | `None` | Pronunciation dictionary to apply. **v3 only.** |
+| `min_buffer_size` | `int` | `50` | Buffered characters that trigger a flush to the model — lower cuts first-audio latency. |
+| `max_chunk_length` | `int` | `150` | Maximum sentence-split length. |
+
+Because the defaults are always sent, model-specific knobs go out even when the chosen model has no use for them (`pitch`/`loudness` to `bulbul:v3`, `temperature` to `bulbul:v2`). Sarvam ignores those rather than rejecting the connection — the same thing the SDK's own `configure()` does.
+
 ## How it works
 
 ```
@@ -99,16 +153,22 @@ from voxkit import VoxkitPipeline
 
 from voxkit.stt import STTProvider, STTOptions, STTEvent, STTEventType
 from voxkit.stt import SarvamSTTProvider, SarvamSTTOptions
+from voxkit.stt import SarvamSTTModel, SarvamSTTMode, SarvamSTTLanguageCode, SarvamSTTInputAudioCodec
 
 from voxkit.tts import TTSProvider, TTSOptions, TTSEvent, TTSEventType
 from voxkit.tts import SarvamTTSProvider, SarvamTTSOptions
+from voxkit.tts import (
+    SarvamTTSModel, SarvamTTSLanguageCode, SarvamTTSSpeaker,
+    SarvamTTSAudioCodec, SarvamTTSAudioBitrate, SarvamTTSSampleRate,
+)
 
 from voxkit.llm import LLMEvent, LLMEventType
 ```
 
 - **`VoxkitPipeline(stt, tts, agent, callback, thread_id="default", interrupt=True)`** — the orchestrator. `agent` is any compiled LangGraph graph; `callback` is an `async def(event: TTSEvent) -> None` that receives every TTS event. `thread_id` is passed to the agent's config on every turn so LangGraph-checkpointed memory persists across turns.
 - **`STTProvider` / `TTSProvider`** — abstract base classes a new provider implements to plug into the pipeline. See their docstrings (or the [API reference](#documentation) below) for the exact contract.
-- **`SarvamSTTProvider` / `SarvamTTSProvider`** — the bundled provider implementations, backed by [Sarvam AI](https://www.sarvam.ai/)'s streaming STT/TTS websockets.
+- **`SarvamSTTProvider` / `SarvamTTSProvider`** — the bundled provider implementations, backed by [Sarvam AI](https://www.sarvam.ai/)'s streaming STT/TTS websockets. Configured via `SarvamSTTOptions` / `SarvamTTSOptions` ([full option tables](#sarvam-provider-options)). `SarvamSTTProvider` additionally exposes `await stt.flush()`, which forces Sarvam to finalize buffered audio without waiting for VAD — useful when you know the utterance is over (requires `flush_signal=True`).
+- **Sarvam value types** — `SarvamSTTModel`, `SarvamSTTMode`, `SarvamSTTLanguageCode`, `SarvamSTTInputAudioCodec`, `SarvamTTSModel`, `SarvamTTSLanguageCode`, `SarvamTTSSpeaker`, `SarvamTTSAudioCodec`, `SarvamTTSAudioBitrate`, `SarvamTTSSampleRate` are `Literal` aliases enumerating every value Sarvam accepts, so bad models/voices/codecs fail at option construction instead of at connect time.
 
 ## Adding a new provider
 
@@ -124,6 +184,19 @@ To build the docs locally:
 pip install -e ".[docs]"
 mkdocs serve
 ```
+
+## Development
+
+Style and linting are handled entirely by [ruff](https://docs.astral.sh/ruff/), configured in [`pyproject.toml`](pyproject.toml). Docstrings are linted too (`pydocstyle`, google convention), since they're what the published API reference is generated from.
+
+```bash
+uv sync                     # install deps, including dev tooling
+uv run pre-commit install   # once per clone: enable the git hook
+uv run ruff check --fix .   # lint
+uv run ruff format .        # format
+```
+
+The pre-commit hook runs `ruff check --fix` then `ruff format` on staged files. If it applies a fix, the commit aborts so you can re-stage — run it over everything at once with `uv run pre-commit run --all-files`.
 
 ## License
 

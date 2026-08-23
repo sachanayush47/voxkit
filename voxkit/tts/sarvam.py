@@ -11,40 +11,156 @@ implemented client-side here by closing the socket and opening a fresh one
 """
 
 import asyncio
-import base64
 import logging
+from typing import Any, Literal
 
-from sarvamai import AsyncSarvamAI, AudioOutput, EventResponse, ErrorResponse
+from pydantic import Field
+from sarvamai import AsyncSarvamAI, AudioOutput, ErrorResponse, EventResponse
+from sarvamai.types import ConfigureConnection, ConfigureConnectionData
 
 from voxkit.llm import LLMEvent, LLMEventType
-from voxkit.tts import TTSOptions, TTSProvider, TTSEvent, TTSEventType
+from voxkit.tts import TTSEvent, TTSEventType, TTSOptions, TTSProvider
 
 logger = logging.getLogger(__name__)
+
+SarvamTTSModel = Literal["bulbul:v2", "bulbul:v3"]
+"""Sarvam streaming TTS models. ``bulbul:v2`` supports pitch/loudness; ``bulbul:v3`` supports temperature."""
+
+SarvamTTSLanguageCode = Literal[
+    "bn-IN",
+    "en-IN",
+    "gu-IN",
+    "hi-IN",
+    "kn-IN",
+    "ml-IN",
+    "mr-IN",
+    "od-IN",
+    "pa-IN",
+    "ta-IN",
+    "te-IN",
+]
+"""BCP-47 codes Sarvam can synthesize in."""
+
+SarvamTTSSpeaker = Literal[
+    # bulbul:v2
+    "anushka",
+    "abhilash",
+    "manisha",
+    "vidya",
+    "arya",
+    "karun",
+    "hitesh",
+    # bulbul:v3
+    "aditya",
+    "ritu",
+    "priya",
+    "neha",
+    "rahul",
+    "pooja",
+    "rohan",
+    "simran",
+    "kavya",
+    "amit",
+    "dev",
+    "ishita",
+    "shreya",
+    "ratan",
+    "varun",
+    "manan",
+    "sumit",
+    "roopa",
+    "kabir",
+    "aayan",
+    "shubh",
+    "ashutosh",
+    "advait",
+    "amelia",
+    "sophia",
+]
+"""Sarvam voices. A speaker only works with the model version it belongs to (see the groups above)."""
+
+SarvamTTSAudioCodec = Literal["linear16", "mulaw", "alaw", "opus", "flac", "aac", "wav", "mp3"]
+"""Output audio codecs. ``linear16`` is raw PCM, which is what most playback paths want."""
+
+SarvamTTSAudioBitrate = Literal["32k", "64k", "96k", "128k", "192k"]
+"""Output bitrate. Only meaningful for the compressed codecs (``mp3``, ``aac``, ``opus``)."""
+
+SarvamTTSSampleRate = Literal[8000, 16000, 22050, 24000]
+"""Output sample rates Sarvam supports. Defaults to 22050 on ``bulbul:v2`` and 24000 on ``bulbul:v3``."""
 
 
 class SarvamTTSOptions(TTSOptions):
     """Configuration for :class:`SarvamTTSProvider`.
 
+    Defaults mirror the ``sarvamai`` SDK's own defaults, so constructing this
+    with only the required fields behaves the same as calling the SDK's
+    ``configure()`` helper with no extra arguments. The two exceptions are
+    :attr:`output_audio_codec` and :attr:`speech_sample_rate`, which default to
+    raw 24 kHz PCM (what voxkit's playback path wants) rather than the SDK's
+    22.05 kHz MP3.
+
+    Several knobs are model-specific, and Sarvam silently ignores rather than
+    rejects the ones that don't apply: :attr:`pitch` and :attr:`loudness` are
+    ignored by ``bulbul:v3``, while :attr:`temperature` and :attr:`dict_id` are
+    ignored by ``bulbul:v2``. A field left ``None`` is omitted from the config
+    message entirely, leaving Sarvam's server-side default in effect.
+
     Attributes:
         api_key: Sarvam API subscription key.
         model: Sarvam TTS model name, e.g. ``"bulbul:v3"``.
         target_language_code: BCP-47 language code to synthesize in, e.g. ``"en-IN"``.
-        speaker: Sarvam speaker/voice name, e.g. ``"priya"``.
+        speaker: Sarvam speaker/voice name, e.g. ``"priya"``. Must belong to
+            the chosen :attr:`model`.
         send_completion_event: Whether Sarvam should send an ``EventResponse``
             with ``event_type == "final"`` when synthesis for a flushed
             request completes (mapped to
             :attr:`~voxkit.tts.base.TTSEventType.END_OF_TURN`).
-        output_audio_codec: Output audio codec, e.g. ``"linear16"``.
-        speech_sample_rate: Output audio sample rate in Hz, e.g. ``24000``.
+        output_audio_codec: Output audio codec. Defaults to ``"linear16"``
+            (raw PCM); the SDK's own default is ``"mp3"``.
+        output_audio_bitrate: Output bitrate for compressed codecs. Only
+            meaningful for ``mp3``/``aac``/``opus``.
+        speech_sample_rate: Output audio sample rate in Hz. Defaults to
+            ``24000``, which is ``bulbul:v3``'s native rate; the SDK's own
+            default is ``22050``.
+        pace: Speech speed. ``1.0`` is normal; the usable range is 0.3-3.0 on
+            ``bulbul:v2`` and 0.5-2.0 on ``bulbul:v3``.
+        pitch: Voice pitch, roughly -0.75 to 0.75, ``0.0`` being the voice's
+            natural pitch. ``bulbul:v2`` only.
+        loudness: Output loudness, roughly 0.3 to 3.0, ``1.0`` being normal.
+            ``bulbul:v2`` only.
+        temperature: Synthesis randomness, roughly 0.01 to 1.0. Lower is more
+            deterministic and consistent across turns. ``bulbul:v3`` only.
+        enable_preprocessing: Whether to normalize English words and numeric
+            entities (numbers, dates, ...) before synthesis. Worth turning on
+            for mixed-language text. Always on for ``bulbul:v3``.
+        dict_id: ID of a pronunciation dictionary (created via Sarvam's
+            ``/text-to-speech/pronunciation-dictionary`` endpoints) to apply
+            during synthesis. ``None`` means no dictionary. ``bulbul:v3`` only.
+        min_buffer_size: Minimum number of buffered characters that triggers a
+            flush to the model. Lower values cut first-audio latency at the
+            cost of more, smaller requests.
+        max_chunk_length: Maximum length Sarvam will split a sentence at.
     """
 
     api_key: str
-    model: str
-    target_language_code: str
-    speaker: str
+    model: SarvamTTSModel
+    target_language_code: SarvamTTSLanguageCode
+    speaker: SarvamTTSSpeaker
     send_completion_event: bool = True
-    output_audio_codec: str = "linear16"
-    speech_sample_rate: int = 24000
+
+    output_audio_codec: SarvamTTSAudioCodec = "linear16"
+    output_audio_bitrate: SarvamTTSAudioBitrate = "128k"
+    speech_sample_rate: SarvamTTSSampleRate = 24000
+
+    pace: float = 1.0
+    pitch: float = 0.0
+    loudness: float = 1.0
+    temperature: float = 0.6
+
+    enable_preprocessing: bool = False
+    dict_id: str | None = None
+    min_buffer_size: int = Field(default=50, ge=1)
+    max_chunk_length: int = Field(default=150, ge=1)
 
 
 class SarvamTTSProvider(TTSProvider):
@@ -78,19 +194,53 @@ class SarvamTTSProvider(TTSProvider):
         self._tasks: list[asyncio.Task] = []
         self._closed = False
 
+    def _config_message(self) -> ConfigureConnection:
+        """Build the ``config`` message sent as the first frame after connecting.
+
+        Most fields carry the SDK's own defaults, so they are always sent.
+        Anything that is nonetheless ``None`` (``dict_id``, unless set) is left
+        out of the message rather than sent as a null, so Sarvam's server-side
+        default stays in effect.
+
+        Returns:
+            The config message to send on the socket.
+        """
+        options = self.options
+        optional: dict[str, Any] = {
+            "output_audio_bitrate": options.output_audio_bitrate,
+            "pace": options.pace,
+            "pitch": options.pitch,
+            "loudness": options.loudness,
+            "temperature": options.temperature,
+            "enable_preprocessing": options.enable_preprocessing,
+            "dict_id": options.dict_id,
+            "min_buffer_size": options.min_buffer_size,
+            "max_chunk_length": options.max_chunk_length,
+        }
+        return ConfigureConnection(
+            data=ConfigureConnectionData(
+                model=options.model,
+                target_language_code=options.target_language_code,
+                speaker=options.speaker,
+                output_audio_codec=options.output_audio_codec,
+                speech_sample_rate=options.speech_sample_rate,
+                **{key: value for key, value in optional.items() if value is not None},
+            )
+        )
+
     async def connect(self) -> None:
         """Open the Sarvam text-to-speech streaming websocket and send the initial config message."""
         self._ctx = self.client.text_to_speech_streaming.connect(
             model=self.options.model,
-            send_completion_event=self.options.send_completion_event,
+            send_completion_event="true" if self.options.send_completion_event else "false",
         )
         self.ws = await self._ctx.__aenter__()
-        await self.ws.configure(
-            target_language_code=self.options.target_language_code,
-            speaker=self.options.speaker,
-            output_audio_codec=self.options.output_audio_codec,
-            speech_sample_rate=self.options.speech_sample_rate,
-        )
+        # The SDK's ws.configure() helper predates `temperature` and doesn't
+        # expose it, and it substitutes its own defaults for every knob the
+        # caller leaves out -- including pitch/loudness, which bulbul:v3
+        # rejects. Sending the config model directly is what lets us forward
+        # exactly the options that were actually set.
+        await self.ws._send_model(self._config_message())
 
     def synthesize(self) -> None:
         """Spin up the internal send/receive loops as background tasks. Call after :meth:`connect`."""
