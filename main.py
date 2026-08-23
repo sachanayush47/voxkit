@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_groq import ChatGroq
 
-from voxkit.core.pipeline import VoxkitPipeline
+from voxkit.core.pipeline import PipelineConfig, VoxkitPipeline
 from voxkit.llm import LLMEventType
 from voxkit.stt import SarvamSTTOptions, SarvamSTTProvider
 from voxkit.tts import SarvamTTSOptions, SarvamTTSProvider, TTSEvent, TTSEventType
@@ -103,7 +103,7 @@ async def main() -> None:
             await asyncio.to_thread(playback.abort)
             await asyncio.to_thread(playback.start)
 
-    pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event, interrupt=True)
+    pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event, config=PipelineConfig(interrupt=True))
 
     logger.info("Speak into your microphone (Ctrl+C to stop)...")
 

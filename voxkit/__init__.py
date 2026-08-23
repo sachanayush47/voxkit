@@ -32,7 +32,7 @@ interfaces and event types, and :class:`~voxkit.core.pipeline.VoxkitPipeline`
 for the orchestrator itself.
 """
 
-from voxkit.core import VoxkitPipeline
+from voxkit.core import PipelineConfig, VoxkitPipeline
 from voxkit.llm import LLMEvent, LLMEventType
 from voxkit.stt import (
     SarvamSTTOptions,
@@ -56,6 +56,7 @@ __version__ = "0.0.1"
 __all__ = [
     "LLMEvent",
     "LLMEventType",
+    "PipelineConfig",
     "STTEvent",
     "STTEventType",
     "STTOptions",

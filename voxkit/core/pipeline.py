@@ -11,6 +11,7 @@ import contextlib
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 
 from langgraph.graph.state import CompiledStateGraph
 
@@ -24,6 +25,39 @@ SENTENCE_BOUNDARY = re.compile(r"[.!?]+[\s]|[,;][\s]")
 """Matches a sentence/clause boundary in streamed LLM output (terminal punctuation followed by whitespace)."""
 
 
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Behavioural settings for a :class:`VoxkitPipeline`.
+
+    Holds the pipeline's tuning knobs, keeping them separate from the
+    collaborators (STT/TTS providers, agent, callback) that are passed to
+    :class:`VoxkitPipeline` positionally. Every field has a default, so
+    ``PipelineConfig()`` is a valid "just use the defaults" config -- which is
+    exactly what :class:`VoxkitPipeline` falls back to when no config is given.
+
+    Frozen (immutable): the pipeline reads these values on every turn, so
+    mutating them mid-run would change behaviour halfway through a
+    conversation. Build a new config instead.
+
+    Attributes:
+        thread_id: Passed to the agent as ``configurable.thread_id`` on every
+            turn, so LangGraph-checkpointed conversation memory persists across
+            turns within one pipeline instance. Use a distinct value per
+            concurrent conversation.
+        interrupt: If ``True`` (default), a detected
+            :attr:`~voxkit.stt.base.STTEventType.SPEECH_START` cancels the
+            in-flight agent turn and interrupts TTS playback (barge-in). If
+            ``False``, ``SPEECH_START`` never interrupts the current turn.
+
+    Example:
+        >>> config = PipelineConfig(thread_id="caller-42", interrupt=False)
+        >>> pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event, config=config)
+    """
+
+    thread_id: str = "default"
+    interrupt: bool = True
+
+
 class VoxkitPipeline:
     """Runs a full voice-agent turn loop: audio in, agent reasoning, audio out.
 
@@ -34,7 +68,8 @@ class VoxkitPipeline:
     boundaries, interrupts) to ``callback`` for the caller to act on (e.g.
     play audio, clear a playback buffer).
 
-    Barge-in is handled internally: if ``interrupt`` is enabled and the STT
+    Barge-in is handled internally: if :attr:`PipelineConfig.interrupt` is
+    enabled and the STT
     provider reports :attr:`~voxkit.stt.base.STTEventType.SPEECH_START` while
     the agent is still generating or the TTS provider is still speaking, the
     in-flight turn is cancelled and the TTS provider is told to interrupt.
@@ -53,8 +88,7 @@ class VoxkitPipeline:
         tts: TTSProvider,
         agent: CompiledStateGraph,
         callback: Callable[[TTSEvent], Awaitable[None]],
-        thread_id: str = "default",
-        interrupt: bool = True,
+        config: PipelineConfig | None = None,
     ) -> None:
         """Wire up the pipeline. Call :meth:`run` to start it.
 
@@ -71,21 +105,15 @@ class VoxkitPipeline:
                 (audio chunks, turn/interrupt markers) as it's produced. This
                 is the pipeline's only output channel to the caller -- e.g.
                 write audio to a speaker, or forward it over a websocket.
-            thread_id: Passed to the agent as ``configurable.thread_id`` on
-                every turn, so LangGraph-checkpointed conversation memory
-                persists across turns within this pipeline instance.
-            interrupt: If ``True`` (default), a detected
-                :attr:`~voxkit.stt.base.STTEventType.SPEECH_START` cancels
-                the in-flight agent turn and interrupts TTS playback
-                (barge-in). If ``False``, ``SPEECH_START`` never interrupts
-                the current turn.
+            config: Behavioural settings (conversation ``thread_id``,
+                barge-in on/off). Defaults to ``PipelineConfig()`` --
+                thread id ``"default"``, barge-in enabled.
         """
         self.stt: STTProvider = stt
         self.tts: TTSProvider = tts
         self.agent: CompiledStateGraph = agent
         self.callback = callback
-        self.thread_id = thread_id
-        self.interrupt = interrupt
+        self.config: PipelineConfig = config or PipelineConfig()
 
         self.stt_output_queue: asyncio.Queue[STTEvent] = self.stt.get_output_queue()
         self.llm_output_queue: asyncio.Queue[LLMEvent] = self.tts.get_input_queue()
@@ -131,7 +159,7 @@ class VoxkitPipeline:
             if event.type == STTEventType.SPEECH_START:
                 # Interrupt: user started talking while the agent may still be
                 # generating/speaking. Cancel the in-flight turn immediately.
-                if self.interrupt:
+                if self.config.interrupt:
                     await self.__handle_interrupt()
 
             elif event.type == STTEventType.FINAL_TRANSCRIPT:
@@ -264,7 +292,7 @@ class VoxkitPipeline:
             sentence once the agent finishes (unless cancelled).
         """
         buffer = ""
-        config = {"configurable": {"thread_id": self.thread_id}}
+        config = {"configurable": {"thread_id": self.config.thread_id}}
 
         async for message_chunk, _metadata in self.agent.astream(
             {"messages": [("user", text)]},

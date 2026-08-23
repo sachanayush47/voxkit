@@ -136,7 +136,7 @@ audio in ──▶ STTProvider ──▶ VoxkitPipeline ──▶ LangGraph agen
 2. **STT emits `STTEvent`s** — `SPEECH_START`/`SPEECH_END` (voice activity), `PARTIAL_TRANSCRIPT`, `FINAL_TRANSCRIPT`, `STREAM_CLOSED`.
 3. **On `FINAL_TRANSCRIPT`**, the pipeline starts a new agent turn: it streams tokens from your LangGraph agent (`agent.astream(..., stream_mode="messages")`), buffers them, and forwards each complete sentence to TTS as soon as a sentence/clause boundary is detected — so speech synthesis starts well before the agent has finished generating the full reply.
 4. **TTS emits `TTSEvent`s** — `AUDIO` (a synthesized chunk), `END_OF_TURN`, `INTERRUPT`, `STREAM_CLOSED` — which the pipeline forwards verbatim to your `callback`. You decide what to do with each: play `AUDIO`, stop playback on `INTERRUPT`, mark the turn done on `END_OF_TURN`.
-5. **Barge-in:** if the STT provider reports `SPEECH_START` while the agent is still generating or TTS is still speaking, the pipeline cancels the in-flight turn, tells TTS to interrupt, and notifies your callback — all before the next turn starts. Pass `interrupt=False` to `VoxkitPipeline` to disable this and let turns run to completion regardless of new speech.
+5. **Barge-in:** if the STT provider reports `SPEECH_START` while the agent is still generating or TTS is still speaking, the pipeline cancels the in-flight turn, tells TTS to interrupt, and notifies your callback — all before the next turn starts. Pass `config=PipelineConfig(interrupt=False)` to `VoxkitPipeline` to disable this and let turns run to completion regardless of new speech.
 
 ### Event types
 
@@ -165,7 +165,8 @@ from voxkit.tts import (
 from voxkit.llm import LLMEvent, LLMEventType
 ```
 
-- **`VoxkitPipeline(stt, tts, agent, callback, thread_id="default", interrupt=True)`** — the orchestrator. `agent` is any compiled LangGraph graph; `callback` is an `async def(event: TTSEvent) -> None` that receives every TTS event. `thread_id` is passed to the agent's config on every turn so LangGraph-checkpointed memory persists across turns.
+- **`VoxkitPipeline(stt, tts, agent, callback, config=None)`** — the orchestrator. `agent` is any compiled LangGraph graph; `callback` is an `async def(event: TTSEvent) -> None` that receives every TTS event. `config` is a `PipelineConfig` (defaults to `PipelineConfig()`).
+- **`PipelineConfig(thread_id="default", interrupt=True)`** — the pipeline's behavioural knobs, as a frozen dataclass. `thread_id` is passed to the agent's config on every turn so LangGraph-checkpointed memory persists across turns; `interrupt` toggles barge-in.
 - **`STTProvider` / `TTSProvider`** — abstract base classes a new provider implements to plug into the pipeline. See their docstrings (or the [API reference](#documentation) below) for the exact contract.
 - **`SarvamSTTProvider` / `SarvamTTSProvider`** — the bundled provider implementations, backed by [Sarvam AI](https://www.sarvam.ai/)'s streaming STT/TTS websockets. Configured via `SarvamSTTOptions` / `SarvamTTSOptions` ([full option tables](#sarvam-provider-options)). `SarvamSTTProvider` additionally exposes `await stt.flush()`, which forces Sarvam to finalize buffered audio without waiting for VAD — useful when you know the utterance is over (requires `flush_signal=True`).
 - **Sarvam value types** — `SarvamSTTModel`, `SarvamSTTMode`, `SarvamSTTLanguageCode`, `SarvamSTTInputAudioCodec`, `SarvamTTSModel`, `SarvamTTSLanguageCode`, `SarvamTTSSpeaker`, `SarvamTTSAudioCodec`, `SarvamTTSAudioBitrate`, `SarvamTTSSampleRate` are `Literal` aliases enumerating every value Sarvam accepts, so bad models/voices/codecs fail at option construction instead of at connect time.
