@@ -31,7 +31,7 @@ class STTEventType(Enum):
     """A finalized transcript. ``STTEvent.text`` holds the recognized text; safe to hand to the LLM."""
 
     STREAM_CLOSED = auto()
-    """The STT stream died, whether from an error or a clean close. The provider is done producing events."""
+    """The STT stream died and the provider could not re-establish it. No more events will follow."""
 
 
 @dataclass
@@ -73,10 +73,9 @@ class STTProvider(ABC):
         """Stream raw audio chunks from ``audio_stream`` to the STT backend.
 
         Runs concurrently with :meth:`receive` for the lifetime of the
-        connection. Must return (not raise) on ``asyncio.CancelledError`` from
-        normal pipeline shutdown, and should push
-        :attr:`STTEventType.STREAM_CLOSED` onto :attr:`output` if sending fails
-        unexpectedly.
+        connection. Should recover from a dropped connection itself, pushing
+        :attr:`STTEventType.STREAM_CLOSED` onto :attr:`output` only if it
+        can't.
 
         Args:
             audio_stream: An async iterator yielding raw audio byte chunks
@@ -89,9 +88,9 @@ class STTProvider(ABC):
         """Read messages from the STT backend and push :class:`STTEvent` onto :attr:`output`.
 
         Runs concurrently with :meth:`send` for the lifetime of the
-        connection. Must keep running until the stream closes, pushing
-        :attr:`STTEventType.STREAM_CLOSED` when it does (whether from a clean
-        close or an error).
+        connection. Should recover from a dropped connection itself, pushing
+        :attr:`STTEventType.STREAM_CLOSED` only once the stream is
+        unrecoverable -- the pipeline stops when it sees that event.
         """
         ...
 

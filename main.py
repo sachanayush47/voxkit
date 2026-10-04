@@ -10,9 +10,9 @@ from langchain.agents import create_agent
 from langchain_groq import ChatGroq
 
 from voxkit.core.pipeline import PipelineConfig, VoxkitPipeline
-from voxkit.llm import LLMEventType
 from voxkit.stt import SarvamSTTOptions, SarvamSTTProvider
 from voxkit.tts import SarvamTTSOptions, SarvamTTSProvider, TTSEvent, TTSEventType
+from voxkit.turn import PipecatSmartTurnDetector
 
 load_dotenv()
 
@@ -20,6 +20,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s:%(name)s:%(message)s",
 )
+
+logging.getLogger("voxkit").setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 
@@ -69,23 +71,15 @@ async def microphone_stream() -> AsyncIterator[bytes]:
             yield await queue.get()
 
 
-async def log_llm_output(queue: asyncio.Queue) -> None:
-    while True:
-        event = await queue.get()
-        match event.type:
-            case LLMEventType.SENTENCE:
-                logger.info("LLM: %s", event.text)
-            case LLMEventType.END_OF_TURN:
-                logger.info("Turn complete")
-            case LLMEventType.INTERRUPT:
-                logger.info("Interrupted")
-
-
 async def main() -> None:
     stt = SarvamSTTProvider(options)
     tts = SarvamTTSProvider(tts_options)
     agent = create_agent(
-        model=ChatGroq(model="llama-3.3-70b-versatile"),
+        system_prompt=(
+            "You are in a realtime voice conversation with a human. Your replies are spoken aloud, "
+            "so answer in a few short, plain sentences. Never use markdown, lists, tables or emojis."
+        ),
+        model=ChatGroq(model="openai/gpt-oss-120b"),
         tools=[],
     )
 
@@ -103,18 +97,20 @@ async def main() -> None:
             await asyncio.to_thread(playback.abort)
             await asyncio.to_thread(playback.start)
 
-    pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event, config=PipelineConfig(interrupt=True))
+    pipeline = VoxkitPipeline(
+        stt,
+        tts,
+        agent,
+        handle_tts_event,
+        config=PipelineConfig(interrupt=True, resume_window=2.0),
+        end_of_turn=PipecatSmartTurnDetector(sample_rate=SAMPLE_RATE),
+    )
 
     logger.info("Speak into your microphone (Ctrl+C to stop)...")
 
-    pipeline_task = asyncio.create_task(pipeline.run(microphone_stream()))
-    output_task = asyncio.create_task(log_llm_output(pipeline.llm_output_queue))
-
     try:
-        await pipeline_task
+        await pipeline.run(microphone_stream())
     finally:
-        output_task.cancel()
-        await asyncio.gather(output_task, return_exceptions=True)
         playback.stop()
         playback.close()
 

@@ -13,7 +13,7 @@ from enum import Enum, auto
 
 from pydantic import BaseModel
 
-from voxkit.llm import LLMEvent
+from voxkit.llm import LLMEvent, LLMEventType
 
 
 class TTSEventType(Enum):
@@ -29,7 +29,7 @@ class TTSEventType(Enum):
     """Barge-in: stop playing whatever audio has already been sent to the client, right now."""
 
     STREAM_CLOSED = auto()
-    """The TTS stream died, whether from an error, a clean close, or an interrupt-triggered reconnect."""
+    """The TTS stream died and the provider could not re-establish it."""
 
 
 @dataclass
@@ -50,13 +50,16 @@ class TTSProvider(ABC):
 
     Implementations wrap a vendor SDK/websocket, consume :class:`~voxkit.llm.base.LLMEvent`
     (sentences from the agent) off :attr:`input`, and push
-    synthesized-audio :class:`TTSEvent` onto :attr:`output`. The typical
-    lifecycle, as driven by :class:`~voxkit.core.pipeline.VoxkitPipeline`, is::
+    synthesized-audio :class:`TTSEvent` onto :attr:`output`. Callers drive
+    it through :meth:`speak`, :meth:`end_turn` and :meth:`interrupt` rather
+    than touching :attr:`input` directly. The typical lifecycle, as driven by
+    :class:`~voxkit.core.pipeline.VoxkitPipeline`, is::
 
         await provider.connect()
         provider.synthesize()   # spins up its own internal send/receive tasks
-        # meanwhile, LLMEvent instances are pushed onto provider.get_input_queue()
-        # and TTSEvent instances are read off provider.get_output_queue()
+        await provider.speak("Hello there.")
+        await provider.end_turn()
+        # TTSEvent instances are read off provider.get_output_queue()
         ...
         await provider.close()
     """
@@ -89,6 +92,42 @@ class TTSProvider(ABC):
         """Tear down the connection and release any underlying resources. Safe to call more than once."""
         ...
 
+    async def speak(self, text: str) -> None:
+        """Queue a sentence for synthesis.
+
+        Args:
+            text: The sentence to speak.
+        """
+        await self.input.put(LLMEvent(LLMEventType.SENTENCE, text))
+
+    async def end_turn(self) -> None:
+        """Mark the end of the current turn's sentences, so buffered text is synthesized now.
+
+        A provider answers with one :attr:`TTSEventType.END_OF_TURN` once the
+        turn's audio has all been emitted.
+        """
+        await self.input.put(LLMEvent(LLMEventType.END_OF_TURN))
+
+    async def interrupt(self, cancel_synthesis: bool = True) -> None:
+        """Barge-in: discard pending audio and tell the client to stop playback.
+
+        Drops any not-yet-consumed audio from :attr:`output` and emits
+        :attr:`TTSEventType.INTERRUPT` in its place, so nothing stale reaches
+        the client after the interrupt.
+
+        Args:
+            cancel_synthesis: Also drop queued sentences and tell the backend
+                to abandon in-flight synthesis (``LLMEventType.INTERRUPT``).
+                Pass ``False`` when synthesis has already finished and only
+                the client's playback needs stopping -- backends may treat
+                cancellation as expensive (e.g. a reconnect).
+        """
+        _drain(self.output)
+        self.output.put_nowait(TTSEvent(TTSEventType.INTERRUPT))
+        if cancel_synthesis:
+            _drain(self.input)
+            self.input.put_nowait(LLMEvent(LLMEventType.INTERRUPT))
+
     def get_input_queue(self) -> asyncio.Queue[LLMEvent]:
         """Return the queue that agent-generated :class:`~voxkit.llm.base.LLMEvent` should be pushed onto."""
         return self.input
@@ -107,3 +146,9 @@ class TTSOptions(BaseModel):
     """
 
     pass
+
+
+def _drain(queue: asyncio.Queue) -> None:
+    """Discard every item currently in ``queue`` without blocking."""
+    while not queue.empty():
+        queue.get_nowait()

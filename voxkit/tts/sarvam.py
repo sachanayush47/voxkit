@@ -23,6 +23,9 @@ from voxkit.tts import TTSEvent, TTSEventType, TTSOptions, TTSProvider
 
 logger = logging.getLogger(__name__)
 
+_RECONNECT_ATTEMPTS = 5
+_RECONNECT_DELAY = 1.0
+
 SarvamTTSModel = Literal["bulbul:v2", "bulbul:v3"]
 """Sarvam streaming TTS models. ``bulbul:v2`` supports pitch/loudness; ``bulbul:v3`` supports temperature."""
 
@@ -193,6 +196,7 @@ class SarvamTTSProvider(TTSProvider):
 
         self._tasks: list[asyncio.Task] = []
         self._closed = False
+        self._connected = asyncio.Event()
 
     def _config_message(self) -> ConfigureConnection:
         """Build the ``config`` message sent as the first frame after connecting.
@@ -235,32 +239,44 @@ class SarvamTTSProvider(TTSProvider):
             send_completion_event="true" if self.options.send_completion_event else "false",
         )
         self.ws = await self._ctx.__aenter__()
-        # The SDK's ws.configure() helper predates `temperature` and doesn't
-        # expose it, and it substitutes its own defaults for every knob the
-        # caller leaves out -- including pitch/loudness, which bulbul:v3
-        # rejects. Sending the config model directly is what lets us forward
-        # exactly the options that were actually set.
+        # Not ws.configure(): it lacks `temperature` and injects pitch/loudness defaults bulbul:v3 rejects.
         await self.ws._send_model(self._config_message())
+        self._connected.set()
 
     def synthesize(self) -> None:
         """Spin up the internal send/receive loops as background tasks. Call after :meth:`connect`."""
         self._tasks.append(asyncio.create_task(self._send()))
         self._tasks.append(asyncio.create_task(self._receive_with_reconnect()))
 
-    async def _reconnect(self) -> None:
-        """Close the current socket and open a fresh one.
+    async def _reconnect(self) -> bool:
+        """Replace the current socket with a fresh one, retrying a few times.
 
-        Only the send-side connection reference is swapped here - the running
-        receive loop (bound to the old socket) is expected to end on its own
-        once that socket closes, and :meth:`_receive_with_reconnect` is what
-        notices that and restarts it against whatever connection is current.
+        Returns:
+            ``True`` once connected, ``False`` if every attempt failed or the
+            provider was closed.
         """
-        if self._ctx is not None:
+        await self._close()
+        for attempt in range(1, _RECONNECT_ATTEMPTS + 1):
+            if self._closed:
+                return False
             try:
-                await self._ctx.__aexit__(None, None, None)
+                await self.connect()
+                return True
             except Exception:
-                logger.exception("SarvamTTSProvider: error closing socket during reconnect")
-        await self.connect()
+                logger.warning("SarvamTTSProvider: reconnect attempt %d failed", attempt, exc_info=True)
+                await asyncio.sleep(_RECONNECT_DELAY)
+        logger.error("SarvamTTSProvider: giving up after %d reconnect attempts", _RECONNECT_ATTEMPTS)
+        return False
+
+    async def _close(self) -> None:
+        """Close the current socket, ignoring errors from an already-dead connection."""
+        self._connected.clear()
+        ctx, self._ctx, self.ws = self._ctx, None, None
+        if ctx is not None:
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                logger.debug("SarvamTTSProvider: error closing socket", exc_info=True)
 
     async def _send(self) -> None:
         """Background loop: pull :class:`~voxkit.llm.base.LLMEvent` off :attr:`input` and act on them.
@@ -274,73 +290,65 @@ class SarvamTTSProvider(TTSProvider):
         while True:
             event: LLMEvent = await self.input.get()
             try:
-                if event.type == LLMEventType.SENTENCE:
-                    # Await directly - do NOT create_task this. convert() calls
-                    # must stay strictly ordered on the socket; fire-and-forget
-                    # tasks can interleave and send sentences out of order.
-                    await self.ws.convert(event.text)
+                if event.type == LLMEventType.INTERRUPT:
+                    # A fresh socket is the only way to drop in-flight synthesis. If ws is
+                    # None, the receive loop is already reconnecting after a drop.
+                    if self.ws is not None:
+                        logger.debug("SarvamTTSProvider: interrupt, reconnecting to drop in-flight synthesis")
+                        await self._reconnect()
+                    continue
 
+                await self._connected.wait()
+                if event.type == LLMEventType.SENTENCE:
+                    # Awaited, not create_task'd: sentences must stay ordered on the socket.
+                    await self.ws.convert(event.text)
                 elif event.type == LLMEventType.END_OF_TURN:
                     await self.ws.flush()
-
-                elif event.type == LLMEventType.INTERRUPT:
-                    logger.info("SarvamTTSProvider: interrupt received, closing and reconnecting")
-                    await self._reconnect()
 
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("SarvamTTSProvider: send loop failed")
+                logger.warning("SarvamTTSProvider: failed to send %s", event.type.name, exc_info=True)
 
-    async def _receive(self) -> None:
-        """One pass over the currently-live socket.
+    async def _receive(self, ws: Any) -> None:
+        """Read ``ws`` until it closes, translating messages into :class:`~voxkit.tts.base.TTSEvent`.
 
-        Ends when that socket closes (either due to :meth:`_reconnect` above,
-        or an unexpected drop).
+        Args:
+            ws: The socket to read.
         """
-        async for message in self.ws:
+        async for message in ws:
             if isinstance(message, AudioOutput):
-                audio_b64 = message.data.audio  # Base64 encoded audio bytes
-                await self.output.put(TTSEvent(TTSEventType.AUDIO, audio_b64))
+                await self.output.put(TTSEvent(TTSEventType.AUDIO, message.data.audio))
 
             elif isinstance(message, EventResponse):
-                logger.debug(f"Received completion event: {message.data.event_type}")
+                logger.debug("SarvamTTSProvider: event %s", message.data.event_type)
                 if message.data.event_type == "final":
                     await self.output.put(TTSEvent(TTSEventType.END_OF_TURN))
 
             elif isinstance(message, ErrorResponse):
-                logger.error(f"SarvamTTSProvider received error response: {message.data.message}")
+                logger.error("SarvamTTSProvider: error response: %s", message.data.message)
 
     async def _receive_with_reconnect(self) -> None:
-        """Wrap :meth:`_receive` in an outer retry loop.
+        """Keep reading whichever socket is current, reconnecting if it drops.
 
-        When :meth:`_reconnect` swaps ``self.ws`` for a new connection, the
-        :meth:`_receive` pass currently running is still bound to the old
-        socket object and simply ends once it closes -- it does not follow
-        the swap. This supervisor is what notices that and calls
-        :meth:`_receive` again, which reads ``self.ws`` fresh each time, so it
-        naturally attaches to whatever connection is current now. This is
-        what lets reconnect-on-interrupt stay entirely internal to this
-        provider.
+        An interrupt swaps the socket from :meth:`_send`; the read of the old
+        socket then ends, and this loop simply moves on to the new one. If the
+        *current* socket drops, this loop reconnects, emitting
+        :attr:`~voxkit.tts.base.TTSEventType.STREAM_CLOSED` only if that fails.
         """
         while not self._closed:
+            await self._connected.wait()
+            ws = self.ws
             try:
-                await self._receive()
+                await self._receive(ws)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("SarvamTTSProvider: receive loop failed unexpectedly")
+                if self.ws is ws and not self._closed:
+                    logger.warning("SarvamTTSProvider: connection lost, reconnecting", exc_info=True)
+            if self.ws is ws and not self._closed and not await self._reconnect():
                 await self.output.put(TTSEvent(TTSEventType.STREAM_CLOSED))
-                if self._closed:
-                    return
-                # Unexpected drop, not a controlled reconnect - re-establish
-                # the connection ourselves before looping, since nothing else
-                # triggered a reconnect in this case.
-                try:
-                    await self._reconnect()
-                except Exception:
-                    logger.exception("SarvamTTSProvider: reconnect after failure also failed")
-                    return
+                return
 
     async def close(self) -> None:
         """Cancel the internal send/receive tasks and close the socket. Safe to call more than once."""
@@ -350,7 +358,4 @@ class SarvamTTSProvider(TTSProvider):
                 task.cancel()
 
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        if self._ctx is not None:
-            await self._ctx.__aexit__(None, None, None)
-            self._ctx = None
-            self.ws = None
+        await self._close()

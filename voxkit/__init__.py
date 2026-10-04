@@ -27,7 +27,7 @@ Quick start:
     >>> pipeline = VoxkitPipeline(stt, tts, agent, handle_tts_event)
     >>> await pipeline.run(microphone_stream())
 
-See the ``stt``, ``tts``, and ``llm`` subpackages for the provider
+See the ``stt``, ``tts``, ``llm``, and ``turn`` subpackages for the provider
 interfaces and event types, and :class:`~voxkit.core.pipeline.VoxkitPipeline`
 for the orchestrator itself.
 """
@@ -50,12 +50,15 @@ from voxkit.tts import (
     TTSOptions,
     TTSProvider,
 )
+from voxkit.turn import EndOfTurnDetector, PipecatSmartTurnDetector
 
 __version__ = "0.0.1"
 
 __all__ = [
+    "EndOfTurnDetector",
     "LLMEvent",
     "LLMEventType",
+    "PipecatSmartTurnDetector",
     "PipelineConfig",
     "STTEvent",
     "STTEventType",

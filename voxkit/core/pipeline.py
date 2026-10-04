@@ -7,22 +7,21 @@ events out while handling turn-taking and barge-in (interrupt) internally.
 """
 
 import asyncio
-import contextlib
 import logging
-import re
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 from langgraph.graph.state import CompiledStateGraph
 
-from voxkit.llm import LLMEvent, LLMEventType
-from voxkit.stt import STTEvent, STTEventType, STTProvider
+from voxkit.core.agent import stream_agent_text
+from voxkit.core.text import SentenceSegmenter
+from voxkit.core.turn_gate import EndOfTurnGate
+from voxkit.stt import STTEventType, STTProvider
 from voxkit.tts import TTSEvent, TTSEventType, TTSProvider
+from voxkit.turn import EndOfTurnDetector
 
 logger = logging.getLogger(__name__)
-
-SENTENCE_BOUNDARY = re.compile(r"[.!?]+[\s]|[,;][\s]")
-"""Matches a sentence/clause boundary in streamed LLM output (terminal punctuation followed by whitespace)."""
 
 
 @dataclass(frozen=True)
@@ -30,14 +29,10 @@ class PipelineConfig:
     """Behavioural settings for a :class:`VoxkitPipeline`.
 
     Holds the pipeline's tuning knobs, keeping them separate from the
-    collaborators (STT/TTS providers, agent, callback) that are passed to
-    :class:`VoxkitPipeline` positionally. Every field has a default, so
-    ``PipelineConfig()`` is a valid "just use the defaults" config -- which is
-    exactly what :class:`VoxkitPipeline` falls back to when no config is given.
-
-    Frozen (immutable): the pipeline reads these values on every turn, so
-    mutating them mid-run would change behaviour halfway through a
-    conversation. Build a new config instead.
+    collaborators (providers, agent, callback, detector) passed to
+    :class:`VoxkitPipeline`. Every field has a default, so
+    ``PipelineConfig()`` is a valid "just use the defaults" config. Frozen and
+    stateless, so one config can safely be shared by many pipelines.
 
     Attributes:
         thread_id: Passed to the agent as ``configurable.thread_id`` on every
@@ -47,7 +42,22 @@ class PipelineConfig:
         interrupt: If ``True`` (default), a detected
             :attr:`~voxkit.stt.base.STTEventType.SPEECH_START` cancels the
             in-flight agent turn and interrupts TTS playback (barge-in). If
-            ``False``, ``SPEECH_START`` never interrupts the current turn.
+            ``False``, turns always run to completion; speech during a reply
+            is answered after it.
+        end_of_turn_timeout: Seconds of silence to wait after the end-of-turn
+            detector judges a transcript incomplete before responding anyway.
+            The wait pauses while the user is speaking again. Ignored unless
+            :class:`VoxkitPipeline` is given an ``end_of_turn`` detector.
+        resume_window: Seconds after the user first hears a reply during which
+            barging in counts as "I wasn't finished": the reply is cancelled
+            and the user's previous turn is merged with what they say next,
+            so the agent answers the whole sentence. Barging in later counts
+            as a real interruption ("stop", "ok thanks") and the previous turn
+            is dropped. ``0`` merges only replies the user never heard any of;
+            ``None`` never merges. Only applies when :attr:`interrupt` is on.
+
+    Raises:
+        ValueError: If ``end_of_turn_timeout`` or ``resume_window`` is negative.
 
     Example:
         >>> config = PipelineConfig(thread_id="caller-42", interrupt=False)
@@ -56,23 +66,45 @@ class PipelineConfig:
 
     thread_id: str = "default"
     interrupt: bool = True
+    end_of_turn_timeout: float = 2.0
+    resume_window: float | None = 2.0
+
+    def __post_init__(self) -> None:
+        """Validate field values."""
+        if self.end_of_turn_timeout < 0:
+            raise ValueError(f"end_of_turn_timeout must be >= 0, got {self.end_of_turn_timeout}")
+        if self.resume_window is not None and self.resume_window < 0:
+            raise ValueError(f"resume_window must be >= 0 or None, got {self.resume_window}")
+
+
+@dataclass(eq=False)
+class _Turn:
+    """A committed user turn and the reply being produced for it."""
+
+    text: str
+    task: asyncio.Task | None = None
+    first_audio_at: float | None = None
 
 
 class VoxkitPipeline:
     """Runs a full voice-agent turn loop: audio in, agent reasoning, audio out.
 
     The pipeline consumes an audio stream, feeds it to ``stt``, hands each
-    finalized transcript to ``agent`` as a new turn, streams the agent's
-    reply to ``tts`` sentence-by-sentence as it's generated, and forwards
-    every :class:`~voxkit.tts.base.TTSEvent` (synthesized audio, turn
-    boundaries, interrupts) to ``callback`` for the caller to act on (e.g.
-    play audio, clear a playback buffer).
+    completed user turn to ``agent``, streams the agent's reply to ``tts``
+    sentence-by-sentence as it's generated, and forwards every
+    :class:`~voxkit.tts.base.TTSEvent` (synthesized audio, turn boundaries,
+    interrupts) to ``callback``.
 
-    Barge-in is handled internally: if :attr:`PipelineConfig.interrupt` is
-    enabled and the STT
-    provider reports :attr:`~voxkit.stt.base.STTEventType.SPEECH_START` while
-    the agent is still generating or the TTS provider is still speaking, the
-    in-flight turn is cancelled and the TTS provider is told to interrupt.
+    Turns run one at a time, in order. Barge-in: if
+    :attr:`PipelineConfig.interrupt` is enabled and the STT provider reports
+    :attr:`~voxkit.stt.base.STTEventType.SPEECH_START` while a reply is being
+    generated or spoken, that reply is cancelled and the client is told to
+    stop playback.
+
+    The user's transcript and the agent's full reply are logged at ``DEBUG``
+    on the ``voxkit.core.pipeline`` logger.
+
+    A pipeline runs once: create a new one per conversation.
 
     Example:
         >>> async def handle_tts_event(event: TTSEvent) -> None:
@@ -89,6 +121,7 @@ class VoxkitPipeline:
         agent: CompiledStateGraph,
         callback: Callable[[TTSEvent], Awaitable[None]],
         config: PipelineConfig | None = None,
+        end_of_turn: EndOfTurnDetector | None = None,
     ) -> None:
         """Wire up the pipeline. Call :meth:`run` to start it.
 
@@ -100,31 +133,37 @@ class VoxkitPipeline:
             agent: A compiled LangGraph graph (e.g. from
                 ``langchain.agents.create_agent``). Invoked via
                 ``agent.astream(..., stream_mode="messages")`` once per user
-                turn; any graph exposing that streaming shape works.
+                turn; only its assistant text is spoken, never tool output.
             callback: Called with every :class:`~voxkit.tts.base.TTSEvent`
-                (audio chunks, turn/interrupt markers) as it's produced. This
-                is the pipeline's only output channel to the caller -- e.g.
-                write audio to a speaker, or forward it over a websocket.
-            config: Behavioural settings (conversation ``thread_id``,
-                barge-in on/off). Defaults to ``PipelineConfig()`` --
-                thread id ``"default"``, barge-in enabled.
+                (audio chunks, turn/interrupt markers) as it's produced -- the
+                pipeline's only output channel to the caller. Exceptions it
+                raises are logged and don't stop the pipeline.
+            config: Behavioural settings. Defaults to ``PipelineConfig()``.
+            end_of_turn: Optional end-of-turn check (e.g.
+                :class:`~voxkit.turn.smart_turn.PipecatSmartTurnDetector`). If set,
+                it is fed the input audio and consulted on each transcript;
+                one judged incomplete is held until the user finishes or
+                :attr:`PipelineConfig.end_of_turn_timeout` expires. Detectors
+                hold per-conversation state, so give each pipeline its own.
         """
-        self.stt: STTProvider = stt
-        self.tts: TTSProvider = tts
-        self.agent: CompiledStateGraph = agent
+        self.stt = stt
+        self.tts = tts
+        self.agent = agent
         self.callback = callback
-        self.config: PipelineConfig = config or PipelineConfig()
+        self.config = config or PipelineConfig()
 
-        self.stt_output_queue: asyncio.Queue[STTEvent] = self.stt.get_output_queue()
-        self.llm_output_queue: asyncio.Queue[LLMEvent] = self.tts.get_input_queue()
-        self.tts_output_queue: asyncio.Queue[TTSEvent] = self.tts.get_output_queue()
-
+        self._gate = EndOfTurnGate(end_of_turn, self.config.end_of_turn_timeout, self._start_agent_turn)
         self._background_tasks: list[asyncio.Task] = []
-        self._turn_task: asyncio.Task | None = None
-        self._cancel_event: asyncio.Event = asyncio.Event()
+        self._turns: list[_Turn] = []
+        self._speaking: deque[_Turn] = deque()
+        self._last_heard: _Turn | None = None
+        self._client_has_audio = False
+        self._started = False
 
-        # Tracks whether the bot is actually speaking right now
-        self._is_bot_speaking: bool = False
+    @property
+    def _bot_active(self) -> bool:
+        """Whether a reply is still being generated or synthesized."""
+        return bool(self._turns)
 
     async def run(self, audio_stream: AsyncIterator[bytes]) -> None:
         """Connect the providers and run the pipeline until the STT stream closes.
@@ -137,232 +176,202 @@ class VoxkitPipeline:
             audio_stream: An async iterator yielding raw audio byte chunks to
                 feed to the STT provider, in the encoding/sample rate that
                 provider expects.
+
+        Raises:
+            RuntimeError: If the pipeline has already been run.
         """
+        if self._started:
+            raise RuntimeError("VoxkitPipeline.run() can only be called once; create a new pipeline")
+        self._started = True
+
         await self.stt.connect()
         await self.tts.connect()
         self.tts.synthesize()
 
-        self._background_tasks.append(asyncio.create_task(self.stt.send(audio_stream)))
-        self._background_tasks.append(asyncio.create_task(self.stt.receive()))
-        self._background_tasks.append(asyncio.create_task(self.__consume_tts_output()))
-
+        self._background_tasks += [
+            asyncio.create_task(self.stt.send(self._tap_audio(audio_stream))),
+            asyncio.create_task(self.stt.receive()),
+            asyncio.create_task(self._forward_tts_events()),
+        ]
         try:
-            await self.__consume_stt_events()
+            await self._consume_stt_events()
         finally:
             await self.shutdown()
 
-    async def __consume_stt_events(self) -> None:
-        """Background loop: react to each :class:`~voxkit.stt.base.STTEvent` as it arrives from STT."""
+    async def _tap_audio(self, audio_stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        """Pass ``audio_stream`` through unchanged, feeding each chunk to the end-of-turn gate.
+
+        Args:
+            audio_stream: The caller's audio stream.
+
+        Yields:
+            Each chunk of ``audio_stream``, in order.
+        """
+        async for chunk in audio_stream:
+            self._gate.push_audio(chunk)
+            yield chunk
+
+    async def _consume_stt_events(self) -> None:
+        """Route each :class:`~voxkit.stt.base.STTEvent` until the STT stream closes."""
+        queue = self.stt.get_output_queue()
         while True:
-            event = await self.stt_output_queue.get()
+            event = await queue.get()
+            match event.type:
+                case STTEventType.SPEECH_START:
+                    await self._on_speech_start()
+                case STTEventType.SPEECH_END:
+                    self._gate.on_speech_end()
+                case STTEventType.FINAL_TRANSCRIPT:
+                    if event.text and event.text.strip():
+                        self._gate.on_transcript(event.text.strip())
+                case STTEventType.STREAM_CLOSED:
+                    logger.error("VoxkitPipeline: STT stream closed, stopping pipeline")
+                    return
 
-            if event.type == STTEventType.SPEECH_START:
-                # Interrupt: user started talking while the agent may still be
-                # generating/speaking. Cancel the in-flight turn immediately.
-                if self.config.interrupt:
-                    await self.__handle_interrupt()
+    async def _on_speech_start(self) -> None:
+        """Barge in on the current reply (if enabled), then let the gate know the user is talking."""
+        if self.config.interrupt and (self._bot_active or self._client_has_audio):
+            await self._interrupt()
+        self._gate.on_speech_start()
 
-            elif event.type == STTEventType.FINAL_TRANSCRIPT:
-                if event.text and event.text.strip():
-                    await self.__handle_user_turn(event.text.strip())
+    async def _interrupt(self) -> None:
+        """Cancel every queued or running reply and stop TTS and client playback.
 
-            elif event.type in (STTEventType.SPEECH_END, STTEventType.PARTIAL_TRANSCRIPT):
-                # Knowingly ignored: turn boundaries come from FINAL_TRANSCRIPT,
-                # and partials are never handed to the agent.
-                pass
+        Turns whose reply the user hadn't heard for longer than
+        :attr:`PipelineConfig.resume_window` are handed back to the
+        end-of-turn gate, to be merged with what the user says next.
+        """
+        now = asyncio.get_running_loop().time()
+        cancel_synthesis = self._bot_active
+        candidates = [self._last_heard, *self._turns] if self._last_heard not in self._turns else self._turns
+        resumed = [turn.text for turn in candidates if turn is not None and self._in_resume_window(turn, now)]
+        logger.debug("VoxkitPipeline: barge-in (cancelling synthesis: %s, resuming: %r)", cancel_synthesis, resumed)
 
-            elif event.type == STTEventType.STREAM_CLOSED:
-                logger.error("VoxkitPipeline: STT stream closed, stopping pipeline")
-                return
+        for turn in self._turns:
+            turn.task.cancel()
+        self._turns.clear()
+        self._speaking.clear()
+        self._last_heard = None
+        self._client_has_audio = False
+        await self.tts.interrupt(cancel_synthesis=cancel_synthesis)
+        if resumed:
+            self._gate.restore(" ".join(resumed))
 
-    async def __handle_interrupt(self) -> None:
-        """Cancel the in-flight agent turn (if any) and tell TTS/the client to stop."""
-        # Always drain + signal tts_output_queue
-        # Draining first, then signaling, preserves ordering: nothing stale
-        # can arrive at the client after this INTERRUPT event, since
-        # __consume_tts_output is the only thing that ever calls the client
-        # callback, and it processes this queue strictly in order.
-        await self.__drain(self.tts_output_queue)
-        await self.__signal(self.tts_output_queue, TTSEvent(TTSEventType.INTERRUPT))
-
-        if not self._is_bot_speaking:
-            # Nothing server-side needs cancelling/reconnecting - the LLM
-            # already finished this turn and TTS already sent everything.
-            # The client-side notify above is enough to handle any audio
-            # still sitting in the client's own playback buffer.
-            return
-
-        logger.info("Interrupt detected, cancelling in-flight generation and reconnecting TTS")
-
-        if self._turn_task and not self._turn_task.done():
-            self._cancel_event.set()
-            self._turn_task.cancel()
-
-        # This is the expensive path (triggers SarvamTTSProvider._reconnect())
-        # Only worth paying when the server genuinely believes generation
-        # or synthesis is still in flight.
-        await self.__drain(self.llm_output_queue)
-        await self.__signal(self.llm_output_queue, LLMEvent(LLMEventType.INTERRUPT))
-
-        self._is_bot_speaking = False
-
-    async def __drain(self, queue: "asyncio.Queue") -> None:
-        """Discard every item currently sitting in ``queue`` without blocking."""
-        while not queue.empty():
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-    async def __handle_user_turn(self, text: str) -> None:
-        """Kick off a new agent turn for a finalized user utterance.
+    def _in_resume_window(self, turn: _Turn, now: float) -> bool:
+        """Whether barging in on ``turn``'s reply now means the user wasn't finished.
 
         Args:
-            text: The finalized transcript text for this turn.
-        """
-        # Fresh cancel event per turn - the previous one (if any) stays set for
-        # the task that's unwinding; this one is what the new turn checks.
-        self._cancel_event = asyncio.Event()
-        self._is_bot_speaking = True  # Optimistic - sentences will start flowing to TTS momentarily
-        self._turn_task = asyncio.create_task(self.__run_agent_turn(text, self._cancel_event))
+            turn: The interrupted turn.
+            now: The current event-loop time.
 
-    async def __run_agent_turn(self, text: str, cancel_event: asyncio.Event) -> None:
-        """Stream the agent's reply for ``text`` and forward each sentence to TTS.
+        Returns:
+            ``True`` if ``turn``'s text should be merged into the next turn.
+        """
+        window = self.config.resume_window
+        if window is None:
+            return False
+        return turn.first_audio_at is None or now - turn.first_audio_at <= window
+
+    def _start_agent_turn(self, text: str) -> None:
+        """Queue an agent reply to ``text`` behind any reply still running.
 
         Args:
-            text: The user's transcript for this turn.
-            cancel_event: Set to abandon this turn early (e.g. on barge-in).
+            text: The completed user turn.
         """
+        logger.debug("VoxkitPipeline: user turn %r", text)
+        turn = _Turn(text)
+        previous = self._turns[-1].task if self._turns else None
+        turn.task = asyncio.create_task(self._run_agent_turn(turn, previous))
+        turn.task.add_done_callback(lambda _task: self._on_turn_done(turn))
+        self._turns.append(turn)
+
+    def _on_turn_done(self, turn: _Turn) -> None:
+        """Forget a turn whose task ended without handing anything to TTS.
+
+        Turns that did speak stay tracked until TTS reports their ``END_OF_TURN``.
+
+        Args:
+            turn: The turn whose task just finished.
+        """
+        if turn not in self._speaking and turn in self._turns:
+            self._turns.remove(turn)
+
+    async def _run_agent_turn(self, turn: _Turn, previous: asyncio.Task | None) -> None:
+        """Stream the agent's reply to ``turn`` into TTS, after ``previous`` finishes.
+
+        Cancellation (barge-in) skips the closing ``end_turn``, so a cancelled
+        reply never produces a late ``END_OF_TURN``.
+
+        Args:
+            turn: The user turn to reply to.
+            previous: The task of the turn queued before this one, if any.
+        """
+        segmenter = SentenceSegmenter()
+        spoken: list[str] = []
         try:
-            async for sentence in self.__stream_agent_sentences(text, cancel_event):
-                if cancel_event.is_set():
-                    break
-                await self.llm_output_queue.put(LLMEvent(LLMEventType.SENTENCE, sentence))
+            if previous is not None:
+                await asyncio.wait({previous})
+            async for chunk in stream_agent_text(self.agent, turn.text, self.config.thread_id):
+                for sentence in segmenter.push(chunk):
+                    await self._speak(turn, sentence, spoken)
+            for sentence in segmenter.flush():
+                await self._speak(turn, sentence, spoken)
         except asyncio.CancelledError:
+            logger.debug("VoxkitPipeline: reply cancelled after %r", " ".join(spoken))
             raise
         except Exception:
             logger.exception("VoxkitPipeline: agent turn failed")
-        finally:
-            # Sentinel: tells the TTS provider this turn's sentences are complete.
-            # Distinct from LLMEventType.INTERRUPT -- this means "nothing more is
-            # coming for now," not "stop what's currently playing." If an
-            # interrupt already fired for this same turn, the provider will see
-            # INTERRUPT followed by END_OF_TURN back to back -- harmless.
-            await self.__signal(self.llm_output_queue, LLMEvent(LLMEventType.END_OF_TURN))
 
-    async def __signal(self, queue: "asyncio.Queue", event: LLMEvent | TTSEvent) -> None:
-        """Non-blocking push for control events (``END_OF_TURN``/``INTERRUPT``).
+        logger.debug("VoxkitPipeline: agent replied %r", " ".join(spoken))
+        if spoken:
+            await self.tts.end_turn()
 
-        Usable against either ``llm_output_queue`` or ``tts_output_queue``.
-        Control events aren't real content and shouldn't be subject to the
-        same backpressure as sentences/audio -- if a queue is bounded and
-        full, a plain ``put()`` would suspend waiting for space, which
-        defeats the purpose of a signal that needs to land immediately.
-        Evicts the oldest item instead of waiting.
+    async def _speak(self, turn: _Turn, sentence: str, spoken: list[str]) -> None:
+        """Send one sentence of ``turn``'s reply to TTS.
 
         Args:
-            queue: The queue to push onto (``llm_output_queue`` or ``tts_output_queue``).
-            event: The control event to push.
+            turn: The turn the sentence belongs to.
+            sentence: The sentence to speak.
+            spoken: Sentences of this reply sent so far; appended to.
         """
+        if not spoken:
+            self._speaking.append(turn)
+        await self.tts.speak(sentence)
+        spoken.append(sentence)
+
+    async def _forward_tts_events(self) -> None:
+        """Forward every :class:`~voxkit.tts.base.TTSEvent` from TTS to ``callback``, in order."""
+        queue = self.tts.get_output_queue()
         while True:
+            event = await queue.get()
+            match event.type:
+                case TTSEventType.AUDIO:
+                    self._client_has_audio = True
+                    if self._speaking and self._speaking[0].first_audio_at is None:
+                        self._speaking[0].first_audio_at = asyncio.get_running_loop().time()
+                        self._last_heard = self._speaking[0]
+                case TTSEventType.END_OF_TURN:
+                    if self._speaking:
+                        finished = self._speaking.popleft()
+                        if finished in self._turns:
+                            self._turns.remove(finished)
+                case TTSEventType.STREAM_CLOSED:
+                    logger.error("VoxkitPipeline: TTS stream closed and could not reconnect")
             try:
-                queue.put_nowait(event)
-                return
-            except asyncio.QueueFull:
-                # Raced with a consumer that already drained it -- retry the put.
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-
-    async def __stream_agent_sentences(self, text: str, cancel_event: asyncio.Event) -> AsyncIterator[str]:
-        """Stream tokens from the LangGraph agent, yielding complete sentences as boundaries are found.
-
-        NOTE: Verify this against your actual LangGraph version. ``stream_mode="messages"``
-        is the current pattern for token-level streaming in recent LangGraph releases,
-        yielding ``(message_chunk, metadata)`` tuples where ``message_chunk.content`` holds the
-        incremental text. If your version streams differently, adjust this loop --
-        don't assume this shape is correct without checking.
-
-        Args:
-            text: The user's transcript to send to the agent as this turn's input.
-            cancel_event: Checked between tokens; stops streaming early when set.
-
-        Yields:
-            Each complete sentence/clause as soon as a boundary
-            (:data:`SENTENCE_BOUNDARY`) is detected, plus any trailing partial
-            sentence once the agent finishes (unless cancelled).
-        """
-        buffer = ""
-        config = {"configurable": {"thread_id": self.config.thread_id}}
-
-        async for message_chunk, _metadata in self.agent.astream(
-            {"messages": [("user", text)]},
-            config=config,
-            stream_mode="messages",
-        ):
-            if cancel_event.is_set():
-                return
-
-            token = getattr(message_chunk, "content", "") or ""
-            if not token:
-                continue
-
-            buffer += token
-            match = SENTENCE_BOUNDARY.search(buffer)
-            if match:
-                boundary_idx = match.end()
-                sentence, buffer = buffer[:boundary_idx], buffer[boundary_idx:]
-                if sentence.strip():
-                    yield sentence.strip()
-
-        if buffer.strip() and not cancel_event.is_set():
-            yield buffer.strip()
-
-    async def __consume_tts_output(self) -> None:
-        """Background loop: forward every :class:`~voxkit.tts.base.TTSEvent` from TTS to ``callback``.
-
-        The pipeline doesn't unpack or transform the event for the client --
-        it forwards the full ``TTSEvent`` (type + payload) so the client can
-        branch on ``event.type`` itself (``AUDIO`` -> play, ``INTERRUPT`` ->
-        stop/clear playback, ``END_OF_TURN`` -> mark the bot's turn as
-        finished, etc). Server-side logging still happens here for
-        observability, independent of what the client does with it.
-        """
-        while True:
-            event = await self.tts_output_queue.get()
-
-            if event.type == TTSEventType.END_OF_TURN:
-                logger.debug("VoxkitPipeline: TTS finished speaking this turn")
-                self._is_bot_speaking = False
-
-            elif event.type == TTSEventType.INTERRUPT:
-                logger.info("VoxkitPipeline: forwarding barge-in to client")
-
-            elif event.type == TTSEventType.STREAM_CLOSED:
-                # The provider already attempts its own reconnect internally
-                # before giving up -- by the time this event reaches us, that
-                # has either already succeeded (and audio will keep flowing)
-                # or the provider's internal task has ended for good. Logged
-                # here for observability; still forwarded below in case the
-                # client wants to show a connection-issue indicator.
-                logger.error(
-                    "VoxkitPipeline: TTS reported STREAM_CLOSED -- if this "
-                    "doesn't self-resolve, the provider's internal task may "
-                    "have died; consider monitoring task health directly."
-                )
-
-            await self.callback(event)
+                await self.callback(event)
+            except Exception:
+                logger.exception("VoxkitPipeline: callback failed on %s", event.type.name)
 
     async def shutdown(self) -> None:
-        """Cancel all background tasks and close both providers.
+        """Cancel all background work and close both providers.
 
         Called automatically by :meth:`run` on exit; safe to call directly
         (e.g. to stop the pipeline early from outside).
         """
-        for task in self._background_tasks:
-            if not task.done():
-                task.cancel()
-        if self._turn_task and not self._turn_task.done():
-            self._turn_task.cancel()
-        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._gate.close()
+        tasks = [*self._background_tasks, *(turn.task for turn in self._turns)]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await self.stt.close()
         await self.tts.close()
