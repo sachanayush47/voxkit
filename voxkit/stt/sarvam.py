@@ -18,6 +18,9 @@ from voxkit.stt import STTEvent, STTEventType, STTOptions, STTProvider
 
 logger = logging.getLogger(__name__)
 
+_RECONNECT_ATTEMPTS = 5
+_RECONNECT_DELAY = 1.0
+
 SarvamSTTModel = Literal["saaras:v3", "saarika:v2.5"]
 """Sarvam streaming STT models. ``saarika:v2.5`` is legacy; ``saaras:v3`` is recommended."""
 
@@ -193,6 +196,7 @@ class SarvamSTTProvider(STTProvider):
         """The live streaming socket, set by :meth:`connect`. ``None`` until then."""
 
         self._ctx = None
+        self._closed = False
 
     def _connect_params(self) -> dict[str, Any]:
         """Build the websocket query parameters from :attr:`options`.
@@ -224,9 +228,7 @@ class SarvamSTTProvider(STTProvider):
             "num_initial_ignored_frames": _num(options.num_initial_ignored_frames),
             "api_subscription_key": options.api_key,
         }
-        # language_code is a required keyword on connect(), so it always goes
-        # through - the SDK drops it from the query string when it's None,
-        # which is what makes Sarvam auto-detect the language.
+        # Always passed (required by connect()); the SDK omits None, which makes Sarvam auto-detect.
         return {
             "language_code": options.language_code,
             **{key: value for key, value in params.items() if value is not None},
@@ -237,12 +239,41 @@ class SarvamSTTProvider(STTProvider):
         self._ctx = self.client.speech_to_text_streaming.connect(**self._connect_params())
         self.ws = await self._ctx.__aenter__()
 
+    async def _reconnect(self) -> bool:
+        """Replace the current socket with a fresh one, retrying a few times.
+
+        Returns:
+            ``True`` once connected, ``False`` if every attempt failed or the
+            provider was closed.
+        """
+        await self._close()
+        for attempt in range(1, _RECONNECT_ATTEMPTS + 1):
+            if self._closed:
+                return False
+            try:
+                await self.connect()
+                return True
+            except Exception:
+                logger.warning("SarvamSTTProvider: reconnect attempt %d failed", attempt, exc_info=True)
+                await asyncio.sleep(_RECONNECT_DELAY)
+        logger.error("SarvamSTTProvider: giving up after %d reconnect attempts", _RECONNECT_ATTEMPTS)
+        return False
+
+    async def _close(self) -> None:
+        """Close the current socket, ignoring errors from an already-dead connection."""
+        ctx, self._ctx, self.ws = self._ctx, None, None
+        if ctx is not None:
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                logger.debug("SarvamSTTProvider: error closing socket", exc_info=True)
+
     async def send(self, audio_stream: AsyncIterator[bytes]) -> None:
         """Forward audio chunks from ``audio_stream`` to Sarvam over the open socket.
 
-        Must be called after :meth:`connect`. On failure, pushes
-        :attr:`~voxkit.stt.base.STTEventType.STREAM_CLOSED` onto :attr:`output`
-        instead of raising.
+        Must be called after :meth:`connect`. Chunks that can't be sent
+        while the connection is down are dropped; :meth:`receive` notices the
+        drop and reconnects.
 
         Args:
             audio_stream: An async iterator yielding raw audio byte chunks
@@ -255,18 +286,19 @@ class SarvamSTTProvider(STTProvider):
         if not self.ws:
             raise RuntimeError("SarvamSTTProvider.send() called before connect()")
 
-        try:
-            async for chunk in audio_stream:
+        async for chunk in audio_stream:
+            if self.ws is None:
+                continue
+            try:
                 await self.ws.transcribe(
                     audio=base64.b64encode(chunk).decode("utf-8"),
                     encoding=self.options.encoding,
                     sample_rate=self.options.sample_rate,
                 )
-        except asyncio.CancelledError:
-            raise  # Normal shutdown path - don't report as a stream failure
-        except Exception:
-            logger.exception("SarvamSTTProvider: audio send failed")
-            await self.output.put(STTEvent(STTEventType.STREAM_CLOSED))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("SarvamSTTProvider: audio chunk dropped", exc_info=True)
 
     async def flush(self) -> None:
         """Ask Sarvam to finalize whatever audio it has buffered, without waiting for VAD.
@@ -287,47 +319,56 @@ class SarvamSTTProvider(STTProvider):
     async def receive(self) -> None:
         """Read messages from Sarvam and push translated :class:`~voxkit.stt.base.STTEvent` onto :attr:`output`.
 
-        Calls :meth:`connect` itself if the socket isn't open yet. Runs until
-        the socket closes or errors, at which point
-        :attr:`~voxkit.stt.base.STTEventType.STREAM_CLOSED` is pushed onto
-        :attr:`output`.
+        Calls :meth:`connect` itself if the socket isn't open yet. If the
+        socket drops or the server closes it, it is reconnected and reading
+        continues; :attr:`~voxkit.stt.base.STTEventType.STREAM_CLOSED` is
+        pushed onto :attr:`output` only if reconnecting fails.
         """
         if not self.ws:
             await self.connect()
 
-        try:
-            async for message in self.ws:
-                if message.type == "events":
-                    signal = message.data.signal_type
-                    logger.info(f"Voice activity: {signal}")
-                    if signal == "START_SPEECH":
-                        await self.output.put(STTEvent(STTEventType.SPEECH_START))
-                    elif signal == "END_SPEECH":
-                        await self.output.put(STTEvent(STTEventType.SPEECH_END))
-                    else:
-                        logger.warning(f"Unknown VAD signal_type: {signal}")
+        while not self._closed:
+            try:
+                async for message in self.ws:
+                    await self._handle_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not self._closed:
+                    logger.warning("SarvamSTTProvider: connection lost, reconnecting", exc_info=True)
+            if self._closed:
+                return
+            if not await self._reconnect():
+                await self.output.put(STTEvent(STTEventType.STREAM_CLOSED))
+                return
 
-                elif message.type == "data":
-                    # No partial variant shown in Sarvam's docs or sample -- always final.
-                    logger.debug(f"Transcript: {message.data.transcript}")
-                    await self.output.put(STTEvent(STTEventType.FINAL_TRANSCRIPT, message.data.transcript))
+    async def _handle_message(self, message: Any) -> None:
+        """Translate one Sarvam message into an :class:`~voxkit.stt.base.STTEvent`.
 
-                elif message.type == "error":
-                    logger.error(
-                        f"SarvamSTTProvider received error response ({message.data.code}): {message.data.error}"
-                    )
+        Args:
+            message: A parsed message from the streaming socket.
+        """
+        if message.type == "events":
+            signal = message.data.signal_type
+            logger.debug("SarvamSTTProvider: voice activity %s", signal)
+            if signal == "START_SPEECH":
+                await self.output.put(STTEvent(STTEventType.SPEECH_START))
+            elif signal == "END_SPEECH":
+                await self.output.put(STTEvent(STTEventType.SPEECH_END))
+            else:
+                logger.warning("SarvamSTTProvider: unknown VAD signal_type %r", signal)
 
-                else:
-                    logger.warning(f"Unknown message type: {message.type}")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("SarvamSTTProvider: receive loop failed")
-            await self.output.put(STTEvent(STTEventType.STREAM_CLOSED))
+        elif message.type == "data":
+            logger.debug("SarvamSTTProvider: transcript %r", message.data.transcript)
+            await self.output.put(STTEvent(STTEventType.FINAL_TRANSCRIPT, message.data.transcript))
+
+        elif message.type == "error":
+            logger.error("SarvamSTTProvider: error response (%s): %s", message.data.code, message.data.error)
+
+        else:
+            logger.warning("SarvamSTTProvider: unknown message type %r", message.type)
 
     async def close(self) -> None:
         """Close the Sarvam websocket, if open. Safe to call more than once."""
-        if self._ctx is not None:
-            await self._ctx.__aexit__(None, None, None)
-            self._ctx = None
-            self.ws = None
+        self._closed = True
+        await self._close()

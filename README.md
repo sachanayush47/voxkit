@@ -17,6 +17,17 @@ voxkit wires together a streaming speech-to-text (STT) provider, any LangGraph a
 pip install voxkit
 ```
 
+Optional features are installed as extras:
+
+| Extra | Installs | Enables |
+|---|---|---|
+| `smart-turn` | `onnxruntime`, `transformers`, `huggingface-hub`, `numpy` | [End-of-turn check](#end-of-turn-check) (`PipecatSmartTurnDetector`) |
+| `all` | every extra above | All optional features |
+
+```bash
+pip install "voxkit[all]"
+```
+
 Requires Python 3.13+. Provider SDKs (currently `sarvamai`) and `langchain`/`langgraph` are installed as direct dependencies for now — see [`pyproject.toml`](pyproject.toml).
 
 ## Quick start
@@ -134,9 +145,39 @@ audio in ──▶ STTProvider ──▶ VoxkitPipeline ──▶ LangGraph agen
 
 1. **You feed raw audio** into `pipeline.run(audio_stream)`. It's forwarded to the STT provider.
 2. **STT emits `STTEvent`s** — `SPEECH_START`/`SPEECH_END` (voice activity), `PARTIAL_TRANSCRIPT`, `FINAL_TRANSCRIPT`, `STREAM_CLOSED`.
-3. **On `FINAL_TRANSCRIPT`**, the pipeline starts a new agent turn: it streams tokens from your LangGraph agent (`agent.astream(..., stream_mode="messages")`), buffers them, and forwards each complete sentence to TTS as soon as a sentence/clause boundary is detected — so speech synthesis starts well before the agent has finished generating the full reply.
+3. **On `FINAL_TRANSCRIPT`** (once the optional [end-of-turn check](#end-of-turn-check) agrees the user is done), the pipeline starts a new agent turn: it streams your LangGraph agent's reply (`agent.astream(..., stream_mode="messages")`) and forwards each complete sentence to TTS as soon as a sentence/clause boundary is detected — so speech synthesis starts well before the agent has finished generating the full reply. Only the assistant's own text is spoken (tool results are never read aloud), and markdown/HTML (`**bold**`, tables, `<br>`) is stripped first; fragments with nothing speakable are skipped. Turns run one at a time, in order.
 4. **TTS emits `TTSEvent`s** — `AUDIO` (a synthesized chunk), `END_OF_TURN`, `INTERRUPT`, `STREAM_CLOSED` — which the pipeline forwards verbatim to your `callback`. You decide what to do with each: play `AUDIO`, stop playback on `INTERRUPT`, mark the turn done on `END_OF_TURN`.
-5. **Barge-in:** if the STT provider reports `SPEECH_START` while the agent is still generating or TTS is still speaking, the pipeline cancels the in-flight turn, tells TTS to interrupt, and notifies your callback — all before the next turn starts. Pass `config=PipelineConfig(interrupt=False)` to `VoxkitPipeline` to disable this and let turns run to completion regardless of new speech.
+5. **Barge-in:** if the STT provider reports `SPEECH_START` while the agent is still generating or TTS is still speaking, the pipeline cancels the in-flight turn, tells TTS to interrupt, and notifies your callback — all before the next turn starts. If the reply has already been fully synthesized, only your callback is notified (to stop any audio still playing client-side). If the user barges in within `resume_window` seconds (default `2.0`) of first hearing the reply, they were most likely still mid-sentence and the end-of-turn call was premature — so their previous turn isn't dropped: it's merged with what they say next and answered as one turn ("I want to book a ticket to" + "Bangkok from Delhi"). A barge-in after the window is a real interruption ("stop", "ok thanks") and the previous turn is dropped. `resume_window=0` merges only replies the user never heard; `None` never merges. Pass `config=PipelineConfig(interrupt=False)` to `VoxkitPipeline` to disable this and let turns run to completion regardless of new speech. Speech during a reply is then answered after it.
+
+### Connection drops and logging
+
+The Sarvam providers reconnect on their own when a websocket drops (5 attempts, 1 s apart); the pipeline keeps running and you lose at most the audio in flight. `STREAM_CLOSED` is emitted only when reconnecting fails — on STT that stops the pipeline.
+
+voxkit logs routine activity at `DEBUG` — the user's transcript and the agent's full reply on `voxkit.core.pipeline`, voice activity on `voxkit.stt.sarvam` — and only real failures at `WARNING`/`ERROR`. To watch a conversation:
+
+```python
+logging.getLogger("voxkit").setLevel(logging.DEBUG)
+```
+
+### End-of-turn check
+
+STT VAD ends a turn on silence alone, so a mid-sentence pause ("book it for... um...") gets answered too early. Opt into [Smart Turn v3](https://github.com/pipecat-ai/smart-turn) — a small audio model that judges from intonation and trailing-off whether the user has actually finished:
+
+```bash
+pip install "voxkit[smart-turn]"
+```
+
+```python
+from voxkit import PipelineConfig, PipecatSmartTurnDetector, VoxkitPipeline
+
+pipeline = VoxkitPipeline(
+    stt, tts, agent, handle_tts_event,
+    config=PipelineConfig(end_of_turn_timeout=2.0),
+    end_of_turn=PipecatSmartTurnDetector(sample_rate=16000),  # one detector per pipeline: it buffers that call's audio
+)
+```
+
+The pipeline feeds the input audio to the detector and scores each `FINAL_TRANSCRIPT`'s turn audio locally on CPU (~20 ms). If it sounds unfinished, the transcript is held for up to `end_of_turn_timeout` seconds of silence; further speech is appended and re-scored, and the text is sent anyway when the timeout expires. Needs `pcm_s16le` input; 16 kHz is recommended (8 kHz works but is less reliable). The ~8 MB model downloads from Hugging Face on first use. Implement `EndOfTurnDetector` to plug in your own logic. Off by default.
 
 ### Event types
 
@@ -163,17 +204,23 @@ from voxkit.tts import (
 )
 
 from voxkit.llm import LLMEvent, LLMEventType
+
+from voxkit.turn import EndOfTurnDetector, PipecatSmartTurnDetector
+
+from voxkit.core import SentenceSegmenter, stream_agent_text, to_speakable
 ```
 
-- **`VoxkitPipeline(stt, tts, agent, callback, config=None)`** — the orchestrator. `agent` is any compiled LangGraph graph; `callback` is an `async def(event: TTSEvent) -> None` that receives every TTS event. `config` is a `PipelineConfig` (defaults to `PipelineConfig()`).
-- **`PipelineConfig(thread_id="default", interrupt=True)`** — the pipeline's behavioural knobs, as a frozen dataclass. `thread_id` is passed to the agent's config on every turn so LangGraph-checkpointed memory persists across turns; `interrupt` toggles barge-in.
-- **`STTProvider` / `TTSProvider`** — abstract base classes a new provider implements to plug into the pipeline. See their docstrings (or the [API reference](#documentation) below) for the exact contract.
+- **`VoxkitPipeline(stt, tts, agent, callback, config=None, end_of_turn=None)`** — the orchestrator. `agent` is any compiled LangGraph graph; `callback` is an `async def(event: TTSEvent) -> None` that receives every TTS event (exceptions it raises are logged, not fatal). `config` is a `PipelineConfig` (defaults to `PipelineConfig()`); `end_of_turn` is an optional `EndOfTurnDetector`. A pipeline runs once — create one per conversation.
+- **`PipelineConfig(thread_id="default", interrupt=True, end_of_turn_timeout=2.0, resume_window=2.0)`** — the pipeline's behavioural knobs, as a frozen, stateless dataclass (safe to share). `thread_id` is passed to the agent's config on every turn so LangGraph-checkpointed memory persists across turns; `interrupt` toggles barge-in; `resume_window` decides when a barge-in means "I wasn't finished" (see How it works, step 5); `end_of_turn_timeout` bounds the optional [end-of-turn check](#end-of-turn-check).
+- **`EndOfTurnDetector` / `PipecatSmartTurnDetector`** — the end-of-turn check interface (`push_audio`, `start_turn`, async `is_end_of_turn`) and the bundled Smart Turn v3 implementation (`smart-turn` extra).
+- **`STTProvider` / `TTSProvider`** — abstract base classes a new provider implements to plug into the pipeline. `TTSProvider` also provides `speak(text)`, `end_turn()` and `interrupt(cancel_synthesis=True)`, which is how the pipeline drives it. See their docstrings (or the [API reference](#documentation) below) for the exact contract.
+- **`SentenceSegmenter` / `to_speakable` / `stream_agent_text`** (`voxkit.core`) — the building blocks the pipeline uses to turn agent output into speech: sentence splitting, markdown stripping, and assistant-text-only streaming from a LangGraph agent.
 - **`SarvamSTTProvider` / `SarvamTTSProvider`** — the bundled provider implementations, backed by [Sarvam AI](https://www.sarvam.ai/)'s streaming STT/TTS websockets. Configured via `SarvamSTTOptions` / `SarvamTTSOptions` ([full option tables](#sarvam-provider-options)). `SarvamSTTProvider` additionally exposes `await stt.flush()`, which forces Sarvam to finalize buffered audio without waiting for VAD — useful when you know the utterance is over (requires `flush_signal=True`).
 - **Sarvam value types** — `SarvamSTTModel`, `SarvamSTTMode`, `SarvamSTTLanguageCode`, `SarvamSTTInputAudioCodec`, `SarvamTTSModel`, `SarvamTTSLanguageCode`, `SarvamTTSSpeaker`, `SarvamTTSAudioCodec`, `SarvamTTSAudioBitrate`, `SarvamTTSSampleRate` are `Literal` aliases enumerating every value Sarvam accepts, so bad models/voices/codecs fail at option construction instead of at connect time.
 
 ## Adding a new provider
 
-Implement `STTProvider` or `TTSProvider` (`voxkit/stt/base.py`, `voxkit/tts/base.py`) — both are small interfaces (`connect`, `send`/`receive` for STT, `connect`/`synthesize` for TTS, plus `close`) that push/pull typed events through `asyncio.Queue`s. Nothing else in the pipeline needs to change; `VoxkitPipeline` only depends on these interfaces, not on Sarvam specifically.
+Implement `STTProvider` or `TTSProvider` (`voxkit/stt/base.py`, `voxkit/tts/base.py`) — both are small interfaces (`connect`, `send`/`receive` for STT, `connect`/`synthesize` for TTS, plus `close`) that push/pull typed events through `asyncio.Queue`s. Providers should recover from dropped connections themselves and emit `STREAM_CLOSED` only when they can't. Nothing else in the pipeline needs to change; `VoxkitPipeline` only depends on these interfaces, not on Sarvam specifically.
 
 ## Documentation
 
